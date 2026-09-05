@@ -23,16 +23,22 @@ use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 use crate::audio::AudioProgress;
-#[cfg(not(feature = "usb-test-tone"))]
 use crate::audio::SAMPLES_PER_CHANNEL;
 use crate::audio::{PcmReceiver, PcmSender};
 use crate::usb_audio::{MINIMUM_PACKET_FRAMES, NOMINAL_PACKET_FRAMES, UsbAudioPlayback, VolumeOwner};
 
 const CORE1_STACK_SIZE: usize = 64 * 1024;
-const SYSTEM_CLOCK_HZ: u32 = 225_000_000;
+const SYSTEM_CLOCK_HZ: u32 = 300_000_000;
 const _: () = assert!(usb_audio::SAMPLE_RATE_HZ == audio::SAMPLE_RATE_HZ);
-#[cfg(not(feature = "usb-test-tone"))]
 const PCM_PREBUFFER_BLOCKS: usize = 6;
+const PCM_LOW_WATERMARK_BLOCKS: usize = 4;
+const PCM_HIGH_WATERMARK_BLOCKS: usize = 12;
+const PCM_CORRECTION_INTERVAL_FRAMES: usize = 4_096;
+const _: () = assert!(
+    PCM_LOW_WATERMARK_BLOCKS < PCM_PREBUFFER_BLOCKS
+        && PCM_PREBUFFER_BLOCKS < PCM_HIGH_WATERMARK_BLOCKS
+        && PCM_HIGH_WATERMARK_BLOCKS < audio::PCM_RING_CAPACITY
+);
 
 static mut CORE1_STACK: Stack<CORE1_STACK_SIZE> = Stack::new();
 static EXECUTOR_CORE0: StaticCell<Executor> = StaticCell::new();
@@ -44,15 +50,14 @@ bind_interrupts!(struct Irqs {
 });
 
 struct PcmReader {
-    #[cfg(not(feature = "usb-test-tone"))]
     receiver: PcmReceiver,
-    #[cfg(not(feature = "usb-test-tone"))]
     frame_index: usize,
-    #[cfg(not(feature = "usb-test-tone"))]
     buffering: bool,
-    #[cfg(feature = "usb-test-tone")]
-    tone_phase: u8,
+    last_frame: Option<(i16, i16)>,
+    correction_cooldown_frames: usize,
     underflows: u32,
+    inserted_frames: u32,
+    discarded_frames: u32,
     last_left_sequence: u16,
     last_right_sequence: u16,
     last_timestamp_us: u32,
@@ -61,18 +66,15 @@ struct PcmReader {
 
 impl PcmReader {
     fn new(receiver: PcmReceiver) -> Self {
-        #[cfg(feature = "usb-test-tone")]
-        let _ = receiver;
         Self {
-            #[cfg(not(feature = "usb-test-tone"))]
             receiver,
-            #[cfg(not(feature = "usb-test-tone"))]
             frame_index: 0,
-            #[cfg(not(feature = "usb-test-tone"))]
             buffering: true,
-            #[cfg(feature = "usb-test-tone")]
-            tone_phase: 0,
+            last_frame: None,
+            correction_cooldown_frames: 0,
             underflows: 0,
+            inserted_frames: 0,
+            discarded_frames: 0,
             last_left_sequence: 0,
             last_right_sequence: 0,
             last_timestamp_us: 0,
@@ -80,97 +82,77 @@ impl PcmReader {
         }
     }
 
-    #[cfg(not(feature = "usb-test-tone"))]
     const fn is_buffering(&self) -> bool {
         self.buffering
     }
 
-    #[cfg(feature = "usb-test-tone")]
-    const fn is_buffering(&self) -> bool {
-        false
-    }
-
-    #[cfg(not(feature = "usb-test-tone"))]
     fn buffered_blocks(&self) -> usize {
         self.receiver.len()
     }
 
-    #[cfg(feature = "usb-test-tone")]
-    const fn buffered_blocks(&self) -> usize {
-        0
+    fn next_source_frame(&mut self) -> Option<(i16, i16)> {
+        if self.frame_index == SAMPLES_PER_CHANNEL {
+            self.receiver.receive_done();
+            self.frame_index = 0;
+        }
+
+        let block = self.receiver.try_receive()?;
+        if self.frame_index == 0 {
+            self.last_left_sequence = block.sequence;
+            self.last_right_sequence = block.sequence;
+            self.last_timestamp_us = block.timestamp_us;
+            self.received_blocks = self.received_blocks.wrapping_add(1);
+        }
+        let frame = (block.left[self.frame_index], block.right[self.frame_index]);
+        self.frame_index += 1;
+        Some(frame)
     }
 
-    #[cfg(not(feature = "usb-test-tone"))]
     fn fill_packet(&mut self, stereo_frames: usize, output: &mut [u8]) {
-        let byte_len = stereo_frames * 4;
-        debug_assert_eq!(output.len(), byte_len);
+        debug_assert_eq!(output.len(), stereo_frames * 4);
+        self.correction_cooldown_frames = self.correction_cooldown_frames.saturating_sub(stereo_frames);
         if self.buffering {
             if self.receiver.len() < PCM_PREBUFFER_BLOCKS {
                 self.underflows = self.underflows.wrapping_add(1);
-                output[..byte_len].fill(0);
+                output.fill(0);
                 return;
             }
             self.buffering = false;
         }
 
-        let mut byte_index = 0;
-        while byte_index < byte_len {
-            if self.frame_index == SAMPLES_PER_CHANNEL {
-                self.receiver.receive_done();
-                self.frame_index = 0;
+        let mut output_frames = output.chunks_exact_mut(4);
+        if self.correction_cooldown_frames == 0 {
+            let buffered_blocks = self.receiver.len();
+            if buffered_blocks <= PCM_LOW_WATERMARK_BLOCKS {
+                if let (Some((left, right)), Some(frame)) = (self.last_frame, output_frames.next()) {
+                    write_stereo_frame(frame, left, right);
+                    self.inserted_frames = self.inserted_frames.wrapping_add(1);
+                    self.correction_cooldown_frames = PCM_CORRECTION_INTERVAL_FRAMES;
+                }
+            } else if buffered_blocks >= PCM_HIGH_WATERMARK_BLOCKS && self.next_source_frame().is_some() {
+                self.discarded_frames = self.discarded_frames.wrapping_add(1);
+                self.correction_cooldown_frames = PCM_CORRECTION_INTERVAL_FRAMES;
             }
+        }
 
-            let Some(block) = self.receiver.try_receive() else {
+        while let Some(frame) = output_frames.next() {
+            let Some((left, right)) = self.next_source_frame() else {
                 self.underflows = self.underflows.wrapping_add(1);
                 self.buffering = true;
                 defmt::warn!("PCM underflow; rebuffering, count={}", self.underflows);
-                output[byte_index..byte_len].fill(0);
-                break;
+                frame.fill(0);
+                output_frames.for_each(|remaining| remaining.fill(0));
+                return;
             };
-            if self.frame_index == 0 {
-                self.last_left_sequence = block.sequence;
-                self.last_right_sequence = block.sequence;
-                self.last_timestamp_us = block.timestamp_us;
-                self.received_blocks = self.received_blocks.wrapping_add(1);
-            }
-
-            let remaining_frames = (byte_len - byte_index) / 4;
-            let available_frames = SAMPLES_PER_CHANNEL - self.frame_index;
-            let copied_frames = remaining_frames.min(available_frames);
-            let channel_range = self.frame_index..self.frame_index + copied_frames;
-            for (&left, &right) in block.left[channel_range.clone()]
-                .iter()
-                .zip(&block.right[channel_range])
-            {
-                output[byte_index..byte_index + 2].copy_from_slice(&left.to_le_bytes());
-                output[byte_index + 2..byte_index + 4].copy_from_slice(&right.to_le_bytes());
-                byte_index += 4;
-            }
-            self.frame_index += copied_frames;
+            write_stereo_frame(frame, left, right);
+            self.last_frame = Some((left, right));
         }
     }
+}
 
-    #[cfg(feature = "usb-test-tone")]
-    fn fill_packet(&mut self, stereo_frames: usize, output: &mut [u8]) {
-        // One kilohertz at the configured playback rate.
-        const PERIOD_FRAMES: u8 = NOMINAL_PACKET_FRAMES as u8;
-        const HALF_PERIOD_FRAMES: u8 = PERIOD_FRAMES / 2;
-        const AMPLITUDE: i16 = 8_192;
-
-        let byte_len = stereo_frames * 4;
-        for frame in output[..byte_len].chunks_exact_mut(4) {
-            let sample = if self.tone_phase < HALF_PERIOD_FRAMES {
-                AMPLITUDE
-            } else {
-                -AMPLITUDE
-            };
-            let bytes = sample.to_le_bytes();
-            frame[..2].copy_from_slice(&bytes);
-            frame[2..].copy_from_slice(&bytes);
-            self.tone_phase = (self.tone_phase + 1) % PERIOD_FRAMES;
-        }
-        self.received_blocks = 1;
-    }
+fn write_stereo_frame(output: &mut [u8], left: i16, right: i16) {
+    output[..2].copy_from_slice(&left.to_le_bytes());
+    output[2..].copy_from_slice(&right.to_le_bytes());
 }
 
 #[derive(Clone, Copy)]
@@ -343,7 +325,7 @@ async fn usb_task(
             // Keep the time-critical audio OUT transaction first. A cheap Full-Speed DAC may
             // intermittently omit feedback; repeated failures fall back to the nominal packet
             // size rather than terminating playback.
-            if !cfg!(feature = "usb-test-tone") && feedback_enabled && usb_frames % feedback_interval == 0 {
+            if feedback_enabled && usb_frames % feedback_interval == 0 {
                 match playback.read_feedback() {
                     Ok(value) => {
                         rate.update(value);
@@ -368,12 +350,14 @@ async fn usb_task(
                 let cadence_us = (now - cadence_started).as_micros();
                 cadence_started = now;
                 defmt::info!(
-                    "USB packets={} last_1000_packets_us={} sent_pcm_frames={} buffered_blocks={} underflows={} left_seq={} right_seq={} source_ts={}",
+                    "USB packets={} last_1000_packets_us={} sent_pcm_frames={} buffered_blocks={} underflows={} inserted_frames={} discarded_frames={} left_seq={} right_seq={} source_ts={}",
                     usb_frames,
                     cadence_us,
                     cadence_pcm_frames,
                     pcm.buffered_blocks(),
                     pcm.underflows,
+                    pcm.inserted_frames,
+                    pcm.discarded_frames,
                     pcm.last_left_sequence,
                     pcm.last_right_sequence,
                     pcm.last_timestamp_us
@@ -387,9 +371,9 @@ async fn usb_task(
 #[cortex_m_rt::entry]
 fn main() -> ! {
     let mut clocks = unwrap!(ClockConfig::system_freq(SYSTEM_CLOCK_HZ));
-    // 300 MHz at 1.25 V stopped after warming during a sustained playback test. The previously
-    // stable 225 MHz point retains LC3 headroom while reducing voltage, power, and heat.
-    clocks.core_voltage = CoreVoltage::V1_15;
+    // Stereo LC3 decoding underflows at 225 MHz. Sustained playback therefore needs the measured
+    // decoder headroom at 300 MHz; independent source/DAC clock drift is handled in `PcmReader`.
+    clocks.core_voltage = CoreVoltage::V1_25;
     let p = embassy_rp::init(RpConfig::new(clocks));
     defmt::info!("RP2350 system clock={} Hz", embassy_rp::clocks::clk_sys_freq());
     let mut uart_config = UartConfig::default();

@@ -9,10 +9,6 @@ publish = false
 [workspace]
 resolver = "2"
 
-[features]
-default = []
-usb-test-tone = []
-
 [dependencies]
 ble-audio-link = { path = "../../crates/audio-link" }
 ble-audio-uac-descriptor = { path = "../../crates/uac-descriptor" }

@@ -54,9 +54,14 @@ interleaves both planes while filling the controller's dedicated USB DPRAM, elim
 PCM and USB packet buffers; the final roughly 192-byte SRAM-to-DPRAM write is required by RP2350
 hardware.
 
-The RP2350 uses a 225 MHz target with a 1.15 V core setting. This is still above the chip's rated
-150 MHz operating frequency, so decode timing and long-duration stability remain hardware gates.
-The earlier 300 MHz/1.25 V setting stopped after warming during sustained playback.
+The RP2350 uses an experimental 300 MHz target with a 1.25 V core setting because stereo LC3
+decoding underflows at 225 MHz. This is twice the chip's rated 150 MHz operating frequency, so
+temperature and long-duration stability remain hardware gates.
+
+The BLE source and USB DAC run from independent clocks. USB packet sizes continue to follow the
+DAC's explicit feedback, while the PCM reader keeps its jitter buffer between low and high
+watermarks by occasionally inserting or discarding one stereo frame. Corrections are rate-limited
+and prevent small clock differences from accumulating into a full underflow or overflow.
 
 The firmware uses the no-allocator configuration of the native Rust `lc3-codec` 0.2 decoder. Its
 two-channel working memory is statically allocated, and each decoder channel writes directly into its
@@ -144,8 +149,6 @@ cargo clippy --release --locked -- -D warnings
 # package an RP2350 UF2, copy it to the board, and reboot it
 cargo run --release --locked
 
-# USB-only 1 kHz diagnostic image (bypasses UART and LC3)
-cargo build --release --locked --features usb-test-tone
 ```
 
 The resulting ELF files are:
