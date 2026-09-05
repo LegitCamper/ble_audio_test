@@ -84,10 +84,12 @@ forwarded to the RP2350 as a kind-3 serial frame, so the value that crosses the 
 profile state machine settled on, including its clamping of relative steps. Mute travels separately
 from the level, because unmuting has to restore the previous level rather than zero.
 
-The nRF persists the latest bond in RRAM. On boot and after a disconnect it first sends directed
-advertisements to that saved peer for five seconds, then falls back to normal discoverable
-advertising so a different source can still connect. The peripheral cannot initiate a BLE link,
-but directed advertising gives the saved phone a fast, targeted reconnect opportunity.
+The nRF persists the latest bond in RRAM. On boot and after a disconnect it first sends a
+high-duty directed advertisement to that saved peer for one second, then a hard timer cancels it
+and starts normal discoverable, scannable advertising so a different source can connect. If the
+saved peer has used "Forget This Device", its next pairing request clears the stale runtime and
+RRAM bond before saving the replacement. The peripheral cannot initiate a BLE link, but directed
+advertising gives the saved phone a fast, targeted reconnect opportunity.
 
 On the USB side, volume has exactly one owner, chosen once at configure time. If the
 device exposes a feature unit fed by this stream that claims a writable volume control, the host

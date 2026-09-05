@@ -27,6 +27,7 @@ heapless = "0.9"
 nrf-mpsl = { git = "https://github.com/LegitCamper/nrf-sdc", rev = "478e1f5c5ba2e6c749c06f3a2bf290784194b415", default-features = false, features = ["defmt", "critical-section-impl"] }
 nrf-sdc = { git = "https://github.com/LegitCamper/nrf-sdc", rev = "478e1f5c5ba2e6c749c06f3a2bf290784194b415", default-features = false, features = ["defmt", "peripheral", "central", "nrf54l15-app-s"] }
 panic-probe = { version = "1", features = ["print-defmt"] }
+postcard = "1"
 static_cell = "2"
 trouble-audio = { git = "https://github.com/LegitCamper/trouble_audio", rev = "2abf9f1512cd02a478aa719c85d82816ac0ec599", package = "trouble_audio", default-features = false, features = ["defmt", "nrf-sdc"] }
 trouble-audio-example-apps = { git = "https://github.com/LegitCamper/trouble_audio", rev = "2abf9f1512cd02a478aa719c85d82816ac0ec599", features = ["defmt"] }

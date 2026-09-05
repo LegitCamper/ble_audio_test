@@ -14,16 +14,17 @@ use ble_audio_link::VolumeCommand;
 use bt_hci::cmd::le::{LeReadLocalSupportedFeatures, LeSetHostFeature};
 use bt_hci::controller::{ControllerCmdAsync, ControllerCmdSync};
 use defmt::Debug2Format;
-use embassy_futures::select::{Either4, select4};
+use embassy_futures::select::{Either, Either4, select, select4};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
-use embassy_time::Duration;
+use embassy_time::{Duration, Timer};
 use heapless::Vec as HVec;
 use trouble_audio::cis::{self, CisManager};
 use trouble_audio::prelude::*;
 use trouble_audio::vcs::{Mute, VcsStorage, VolumeFlags, VolumeState};
 use trouble_audio_example_apps::basic_audio_sink::{ADDRESS, MAX_ASES};
-use trouble_audio_example_apps::sink::BondStore;
 use trouble_host::prelude::*;
+
+use crate::bond_store::ClearableBondStore;
 
 /// Max number of simultaneous BLE connections; the ASCS server tracks one at a time.
 const CONNECTIONS_MAX: usize = 1;
@@ -40,7 +41,9 @@ const INITIAL_VOLUME: u8 = 128;
 /// scale, which is close to what phone volume rockers expect.
 const VOLUME_STEP: u8 = 16;
 /// Time spent targeting a saved peer before returning to discoverable advertising.
-const DIRECTED_RECONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DIRECTED_RECONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+/// Idle time that lets the controller apply a queued resolving-list update before advertising.
+const RESOLVING_LIST_SETTLE_TIME: Duration = Duration::from_millis(100);
 
 /// Attribute backing store for every service this sink exposes.
 ///
@@ -57,7 +60,11 @@ struct SinkStorage {
 ///
 /// `cis_manager` is caller-owned so the caller can concurrently drain
 /// [`CisManager::receive_lc3`]; run this alongside whatever does that.
-pub async fn run<C>(controller: C, cis_manager: &CisManager<NoopRawMutex, MAX_ASES>, bond_store: &dyn BondStore) -> !
+pub async fn run<C>(
+    controller: C,
+    cis_manager: &CisManager<NoopRawMutex, MAX_ASES>,
+    bond_store: &dyn ClearableBondStore,
+) -> !
 where
     C: Controller
         + ControllerCmdAsync<LeAcceptCisRequest>
@@ -101,11 +108,11 @@ where
         // No display or keyboard on an audio sink: JustWorks pairing.
         .set_io_capabilities(IoCapabilities::NoInputNoOutput)
         .build();
-    let mut bonded_peer = bond_store.load().map(|bond| {
-        let peer = bond.identity.addr;
+    let mut bonded_identity = bond_store.load().map(|bond| {
+        let identity = bond.identity;
         let _ = stack.add_bond_information(bond);
-        defmt::info!("loaded saved peer for directed reconnect: {}", peer);
-        peer
+        defmt::info!("loaded saved peer for directed reconnect: {}", identity.addr);
+        identity
     });
     let mut runner = stack.runner();
     let mut peripheral = stack.peripheral();
@@ -172,7 +179,7 @@ where
         },
         async {
             loop {
-                let conn = match advertise(advertiser_data, bonded_peer, &mut peripheral, &server).await {
+                let conn = match advertise(advertiser_data, bonded_identity, &mut peripheral, &server).await {
                     Ok(conn) => conn,
                     Err(error) => {
                         defmt::warn!("advertise error: {}", Debug2Format(&error));
@@ -238,7 +245,7 @@ where
                             // recognized on its next reconnect.
                             let _ = stack.add_bond_information(bond.clone());
                             bond_store.save(&bond);
-                            bonded_peer = Some(bond.identity.addr);
+                            bonded_identity = Some(bond.identity);
                         }
                         GattConnectionEvent::PairingComplete {
                             security_level,
@@ -251,6 +258,18 @@ where
                         }
                         GattConnectionEvent::PairingFailed(error) => {
                             defmt::warn!("pairing failed: {}", Debug2Format(&error));
+                        }
+                        GattConnectionEvent::BondLost => {
+                            // A peer that used "Forget This Device" starts a new pairing while
+                            // this sink still has its old keys. Drop both copies now; Trouble
+                            // continues that pairing and PairingComplete stores its replacement.
+                            if let Some(identity) = bonded_identity.take() {
+                                if let Err(error) = stack.remove_bond_information(identity) {
+                                    defmt::warn!("failed to remove stale bond: {}", Debug2Format(&error));
+                                }
+                            }
+                            bond_store.clear();
+                            defmt::info!("peer forgot bond; accepting fresh pairing");
                         }
                         _ => {}
                     }
@@ -290,23 +309,31 @@ fn publish_volume(server: &Server<'_, MAX_ASES, CONNECTIONS_MAX, NoopRawMutex>, 
 
 async fn advertise<'values, 'server, C: Controller>(
     adv_data: &[u8],
-    bonded_peer: Option<Address>,
+    bonded_identity: Option<Identity>,
     peripheral: &mut Peripheral<'values, C, DefaultPacketPool>,
     server: &'server Server<'values, MAX_ASES, CONNECTIONS_MAX, NoopRawMutex>,
 ) -> Result<GattConnection<'values, 'server, DefaultPacketPool>, BleHostError<C::Error>> {
-    if let Some(peer) = bonded_peer {
-        let params = AdvertisementParameters {
-            timeout: Some(DIRECTED_RECONNECT_TIMEOUT),
-            ..Default::default()
-        };
+    if let Some(identity) = bonded_identity {
+        // Resolving-list changes are only applied while the controller is idle. In particular,
+        // this lets it learn a saved peer's IRK before targeting the peer's rotating address.
+        Timer::after(RESOLVING_LIST_SETTLE_TIME).await;
+        let peer = identity.addr;
         let advertiser = peripheral
-            .advertise(&params, Advertisement::ConnectableNonscannableDirected { peer })
+            .advertise(
+                &Default::default(),
+                Advertisement::ConnectableNonscannableDirectedHighDuty { peer },
+            )
             .await?;
         defmt::info!("directed advertising to saved peer: {}", peer);
-        match advertiser.accept().await {
-            Ok(conn) => return Ok(conn.with_attribute_server(&server.server)?),
-            Err(Error::Timeout) => defmt::info!("saved peer did not reconnect; advertising to all peers"),
-            Err(error) => defmt::warn!("directed advertising failed: {}", Debug2Format(&error)),
+        // Legacy advertising ignores AdvertisementParameters::timeout, so enforce a real
+        // wall-clock deadline. Dropping `accept` cancels directed advertising before the normal,
+        // scannable advertisement below is started.
+        match select(advertiser.accept(), Timer::after(DIRECTED_RECONNECT_TIMEOUT)).await {
+            Either::First(Ok(conn)) => return Ok(conn.with_attribute_server(&server.server)?),
+            Either::First(Err(error)) => {
+                defmt::warn!("directed advertising failed: {}", Debug2Format(&error));
+            }
+            Either::Second(()) => defmt::info!("saved peer did not reconnect; advertising to all peers"),
         }
     }
 
