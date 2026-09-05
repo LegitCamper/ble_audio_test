@@ -4,7 +4,11 @@ members = [
     "crates/audio-link",
 ]
 default-members = ["crates/audio-link"]
-exclude = ["firmware/nrf54l15", "firmware/xiao-rp2350"]
+exclude = [
+    "crates/trouble-audio",
+    "firmware/nrf54l15",
+    "firmware/xiao-rp2350",
+]
 
 [workspace.package]
 edition = "2024"

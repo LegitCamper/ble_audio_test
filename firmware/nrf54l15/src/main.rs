@@ -83,7 +83,6 @@ fn build_sdc<'d, const N: usize>(
         .build(peripherals, rng, mpsl, memory)
 }
 
-const MAXIMUM_STEREO_PAIR_SKEW_US: u32 = 5_000;
 const PENDING_FRAMES_PER_CHANNEL: usize = 8;
 
 struct StereoEncodedPair {
@@ -93,6 +92,7 @@ struct StereoEncodedPair {
 
 struct PendingLc3 {
     ase_id: u8,
+    sequence: u16,
     timestamp_us: u32,
     frame: Lc3Frame,
 }
@@ -121,20 +121,23 @@ impl StereoPairer {
             let (Some(left), Some(right)) = (self.left.front(), self.right.front()) else {
                 return None;
             };
-            let left_after_right = left.timestamp_us.wrapping_sub(right.timestamp_us);
-            let right_after_left = right.timestamp_us.wrapping_sub(left.timestamp_us);
-            if left_after_right.min(right_after_left) <= MAXIMUM_STEREO_PAIR_SKEW_US {
+            if left.sequence == right.sequence {
                 return Some((self.left.pop_front()?, self.right.pop_front()?));
             }
 
             self.discarded = self.discarded.wrapping_add(1);
-            if left_after_right < 0x8000_0000 {
+            if sequence_is_after(left.sequence, right.sequence) {
                 let _ = self.right.pop_front();
             } else {
                 let _ = self.left.pop_front();
             }
         }
     }
+}
+
+fn sequence_is_after(sequence: u16, reference: u16) -> bool {
+    let distance = sequence.wrapping_sub(reference);
+    distance != 0 && distance < 0x8000
 }
 
 static LC3_TX_QUEUE: AsyncChannel<CriticalSectionRawMutex, StereoEncodedPair, 4> = AsyncChannel::new();
@@ -179,7 +182,7 @@ async fn forward_lc3(
     led: &mut Output<'static>,
     cis_manager: &CisManager<NoopRawMutex, { basic_audio_sink::MAX_ASES }>,
 ) -> ! {
-    let mut sequence = 0_u16;
+    let mut last_sequence: Option<u16> = None;
     let mut last_timestamp_us = 0_u32;
     let mut pairer = StereoPairer::default();
     let mut started = false;
@@ -196,11 +199,12 @@ async fn forward_lc3(
             continue;
         };
 
-        let micros = Instant::now().as_micros();
-        let timestamp_us = u32::try_from(micros & u64::from(u32::MAX)).unwrap_or_default();
+        let receipt_micros = Instant::now().as_micros();
+        let receipt_timestamp_us = u32::try_from(receipt_micros & u64::from(u32::MAX)).unwrap_or_default();
         let pending = PendingLc3 {
             ase_id: raw.ase_id,
-            timestamp_us,
+            sequence: raw.sequence_number,
+            timestamp_us: raw.timestamp_us.unwrap_or(receipt_timestamp_us),
             frame: raw.frame,
         };
         received_frames = received_frames.wrapping_add(1);
@@ -214,9 +218,11 @@ async fn forward_lc3(
             right.timestamp_us
         };
         let gap_us = timestamp_us.wrapping_sub(last_timestamp_us);
+        let sequence = left.sequence;
+        let sequence_discontinuity = last_sequence.is_some_and(|last| sequence != last.wrapping_add(1));
         let mut flags = if !started || gap_us > 100_000 {
             FrameFlags::STREAM_START
-        } else if gap_us > 15_000 {
+        } else if sequence_discontinuity || gap_us > 15_000 {
             FrameFlags::DISCONTINUITY
         } else {
             FrameFlags::empty()
@@ -257,7 +263,7 @@ async fn forward_lc3(
             queue_overflowed = false;
         }
 
-        sequence = sequence.wrapping_add(1);
+        last_sequence = Some(sequence);
         last_timestamp_us = timestamp_us;
         stereo_pairs = stereo_pairs.wrapping_add(1);
         if stereo_pairs % 40 == 0 {
@@ -268,11 +274,12 @@ async fn forward_lc3(
             let report_us = (now - report_started).as_micros();
             report_started = now;
             defmt::info!(
-                "forwarded stereo_pairs={} received_lc3={} unpaired_lc3={} dropped_pairs={} last_200_pairs_us={}",
+                "forwarded stereo_pairs={} received_lc3={} unpaired_lc3={} dropped_pairs={} hci_sequence={} last_200_pairs_us={}",
                 stereo_pairs,
                 received_frames,
                 pairer.discarded,
                 dropped_pairs,
+                sequence,
                 report_us
             );
         }

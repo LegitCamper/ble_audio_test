@@ -149,9 +149,9 @@ pub struct FrameMeta {
     pub channel: Channel,
     /// ASCS endpoint identifier assigned by the LE Audio peer.
     pub ase_id: u8,
-    /// Per-ASE wrapping sequence number.
+    /// Per-stream wrapping source sequence number.
     pub sequence: u16,
-    /// Sender-local receive timestamp in microseconds, wrapping at `u32::MAX`.
+    /// Source presentation or receive timestamp in microseconds, wrapping at `u32::MAX`.
     pub timestamp_us: u32,
     /// Negotiated sample rate.
     pub sample_rate_hz: u32,

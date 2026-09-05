@@ -20,9 +20,10 @@ fixed storage, so corrupt input cannot grow memory use.
 | 18 + N | 2 | CRC over header and payload |
 
 Encoding 1 accepts at most 155 bytes. The nRF sends a left message followed by a right message for
-each stereo pair. Both messages have the same sequence and timestamp; the RP2350 publishes PCM only
-after matching the two values by sequence. A missing or corrupt message therefore drops a pair
-instead of shifting channel alignment.
+each stereo pair. Both messages retain the controller-provided HCI ISO sequence. They use the HCI
+timestamp when present and otherwise the nRF receive timestamp. The RP2350 publishes PCM only after
+matching the two values by sequence. A missing or corrupt message therefore drops a pair instead of
+shifting channel alignment.
 
 Encoding 2 remains supported for compatibility with the earlier mono path. It contains exactly 480
 samples in 720 bytes: each three-byte group stores two signed 12-bit two's-complement samples, with

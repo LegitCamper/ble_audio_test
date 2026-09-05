@@ -1883,7 +1883,6 @@ dependencies = [
 [[package]]
 name = "trouble_audio"
 version = "0.1.0"
-source = "git+https://github.com/LegitCamper/trouble_audio?rev=894a43024f40f150469c83d5df58d81781044a3c#894a43024f40f150469c83d5df58d81781044a3c"
 dependencies = [
  "aes",
  "bitflags 2.13.1",
