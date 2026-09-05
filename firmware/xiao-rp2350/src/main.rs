@@ -29,7 +29,7 @@ use crate::audio::{PcmReceiver, PcmSender};
 use crate::usb_audio::{MINIMUM_PACKET_FRAMES, NOMINAL_PACKET_FRAMES, UsbAudioPlayback, VolumeOwner};
 
 const CORE1_STACK_SIZE: usize = 64 * 1024;
-const SYSTEM_CLOCK_HZ: u32 = 300_000_000;
+const SYSTEM_CLOCK_HZ: u32 = 225_000_000;
 const _: () = assert!(usb_audio::SAMPLE_RATE_HZ == audio::SAMPLE_RATE_HZ);
 #[cfg(not(feature = "usb-test-tone"))]
 const PCM_PREBUFFER_BLOCKS: usize = 6;
@@ -387,9 +387,9 @@ async fn usb_task(
 #[cortex_m_rt::entry]
 fn main() -> ! {
     let mut clocks = unwrap!(ClockConfig::system_freq(SYSTEM_CLOCK_HZ));
-    // This experimental 300 MHz target is twice the RP2350's rated 150 MHz operation. Use 1.25 V
-    // as an intermediate margin between the stable 225 MHz test and the aggressive 350 MHz test.
-    clocks.core_voltage = CoreVoltage::V1_25;
+    // 300 MHz at 1.25 V stopped after warming during a sustained playback test. The previously
+    // stable 225 MHz point retains LC3 headroom while reducing voltage, power, and heat.
+    clocks.core_voltage = CoreVoltage::V1_15;
     let p = embassy_rp::init(RpConfig::new(clocks));
     defmt::info!("RP2350 system clock={} Hz", embassy_rp::clocks::clk_sys_freq());
     let mut uart_config = UartConfig::default();

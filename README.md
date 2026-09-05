@@ -54,9 +54,9 @@ interleaves both planes while filling the controller's dedicated USB DPRAM, elim
 PCM and USB packet buffers; the final roughly 192-byte SRAM-to-DPRAM write is required by RP2350
 hardware.
 
-The RP2350 currently uses an experimental 300 MHz target with a 1.25 V core setting. This is twice
-the chip's rated 150 MHz operating frequency. It may improve decoder headroom, but temperature,
-flash execution, USB operation, and long-duration stability must be validated on each board.
+The RP2350 uses a 225 MHz target with a 1.15 V core setting. This is still above the chip's rated
+150 MHz operating frequency, so decode timing and long-duration stability remain hardware gates.
+The earlier 300 MHz/1.25 V setting stopped after warming during sustained playback.
 
 The firmware uses the no-allocator configuration of the native Rust `lc3-codec` 0.2 decoder. Its
 two-channel working memory is statically allocated, and each decoder channel writes directly into its
