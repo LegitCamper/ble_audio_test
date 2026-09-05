@@ -1825,7 +1825,6 @@ dependencies = [
 [[package]]
 name = "trouble-audio-example-apps"
 version = "0.1.0"
-source = "git+https://github.com/LegitCamper/trouble_audio?rev=894a43024f40f150469c83d5df58d81781044a3c#894a43024f40f150469c83d5df58d81781044a3c"
 dependencies = [
  "bt-hci",
  "defmt 1.1.1",
@@ -1845,7 +1844,6 @@ dependencies = [
 [[package]]
 name = "trouble-host"
 version = "0.8.0"
-source = "git+https://github.com/LegitCamper/trouble?rev=d30c550f4022c3dbf61a27c49b84873d51dc64fd#d30c550f4022c3dbf61a27c49b84873d51dc64fd"
 dependencies = [
  "aes",
  "bt-hci",
@@ -1870,7 +1868,6 @@ dependencies = [
 [[package]]
 name = "trouble-host-macros"
 version = "0.6.0"
-source = "git+https://github.com/LegitCamper/trouble?rev=d30c550f4022c3dbf61a27c49b84873d51dc64fd#d30c550f4022c3dbf61a27c49b84873d51dc64fd"
 dependencies = [
  "convert_case",
  "darling",

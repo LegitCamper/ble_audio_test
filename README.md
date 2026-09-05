@@ -21,14 +21,14 @@ validation.
 ## Repository layout
 
 - `crates/audio-link`: allocator-free, corruption-resynchronizing UART protocol shared by both MCUs
-- `crates/trouble-audio`: pinned local patch retaining HCI ISO ordering metadata
 - `firmware/nrf54l15`: Trouble Audio unicast sink and selected-channel LC3 transmitter
 - `firmware/xiao-rp2350`: dual-core LC3 decoder/USB bridge and TE-C-specific UAC2 host
 - `docs/serial-protocol.md`: exact version-1 wire format
 
-The firmware directories are separate Cargo workspaces. Trouble Audio uses a newer upstream Embassy
-revision while the RP2350 USB-host implementation uses the pinned LegitCamper host fork; combining
-them would select incompatible global time drivers.
+The firmware directories are separate Cargo workspaces. During development, the nRF firmware uses
+the sibling `trouble_audio` and `trouble` checkouts so fixes remain in their upstream repositories.
+Trouble Audio uses a newer upstream Embassy revision while the RP2350 USB-host implementation uses
+the pinned LegitCamper host fork; combining them would select incompatible global time drivers.
 
 ## What is implemented
 

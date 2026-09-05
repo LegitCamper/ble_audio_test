@@ -28,9 +28,9 @@ nrf-mpsl = { git = "https://github.com/LegitCamper/nrf-sdc", rev = "478e1f5c5ba2
 nrf-sdc = { git = "https://github.com/LegitCamper/nrf-sdc", rev = "478e1f5c5ba2e6c749c06f3a2bf290784194b415", default-features = false, features = ["defmt", "peripheral", "central", "nrf54l15-app-s"] }
 panic-probe = { version = "1", features = ["print-defmt"] }
 static_cell = "2"
-trouble-audio = { path = "../../crates/trouble-audio", package = "trouble_audio", default-features = false, features = ["defmt", "nrf-sdc"] }
-trouble-audio-example-apps = { git = "https://github.com/LegitCamper/trouble_audio", rev = "894a43024f40f150469c83d5df58d81781044a3c", package = "trouble-audio-example-apps", features = ["defmt"] }
-trouble-host = { git = "https://github.com/LegitCamper/trouble", rev = "d30c550f4022c3dbf61a27c49b84873d51dc64fd", features = ["derive", "scan", "gatt", "central", "security", "iso", "default-packet-pool"] }
+trouble-audio = { path = "../../../trouble_audio/trouble-audio", package = "trouble_audio", default-features = false, features = ["defmt", "nrf-sdc"] }
+trouble-audio-example-apps = { path = "../../../trouble_audio/examples/apps", features = ["defmt"] }
+trouble-host = { path = "../../../trouble/host", features = ["derive", "scan", "gatt", "central", "security", "iso", "default-packet-pool"] }
 
 [lints.rust]
 future-incompatible = "warn"
@@ -55,6 +55,3 @@ embassy-sync = { git = "https://github.com/embassy-rs/embassy.git", rev = "03c82
 embassy-time = { git = "https://github.com/embassy-rs/embassy.git", rev = "03c826f2544220cb44b2dec05f5d636a80d39382" }
 embassy-time-driver = { git = "https://github.com/embassy-rs/embassy.git", rev = "03c826f2544220cb44b2dec05f5d636a80d39382" }
 embassy-time-queue-utils = { git = "https://github.com/embassy-rs/embassy.git", rev = "03c826f2544220cb44b2dec05f5d636a80d39382" }
-
-[patch."https://github.com/LegitCamper/trouble_audio"]
-trouble_audio = { path = "../../crates/trouble-audio" }

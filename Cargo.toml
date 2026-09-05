@@ -5,7 +5,6 @@ members = [
 ]
 default-members = ["crates/audio-link"]
 exclude = [
-    "crates/trouble-audio",
     "firmware/nrf54l15",
     "firmware/xiao-rp2350",
 ]
