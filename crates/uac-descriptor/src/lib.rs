@@ -55,6 +55,66 @@ pub const BYTES_PER_FRAME: usize = 4;
 /// Smallest isochronous OUT packet capacity that can carry one nominal 1 ms packet.
 pub const MINIMUM_PACKET_BYTES: usize = (SAMPLE_RATE_HZ as usize / 1_000) * BYTES_PER_FRAME;
 
+/// Highest level on the LE Audio Volume Control Service scale.
+pub const MAXIMUM_LEVEL: u8 = 255;
+/// Full-scale Q15 gain.
+pub const UNITY_GAIN_Q15: u16 = 1 << 15;
+/// USB Audio reserves this volume code for silence rather than treating it as a real level.
+pub const VOLUME_SILENCE: i16 = i16::MIN;
+/// Attenuation the bottom of the volume scale corresponds to.
+///
+/// Volume settings are already logarithmic, so a level maps linearly onto this range. Applying a
+/// further taper, or spanning the device's whole reported range, puts most of the scale below
+/// audibility: DACs commonly report a floor near -127 dB.
+pub const VOLUME_RANGE_DB: i32 = 60;
+
+/// Q15 gains matching [`VOLUME_RANGE_DB`] at evenly spaced levels from 0 to [`MAXIMUM_LEVEL`].
+///
+/// A table keeps the host path on the same decibel curve as the device path without needing a
+/// power function; sixteen segments hold the interpolation error well under the ~0.4 dB a
+/// listener can notice.
+const HOST_GAIN_Q15: [u16; 17] = [
+    33, 50, 78, 120, 184, 284, 437, 673, 1036, 1596, 2457, 3784, 5827, 8973, 13818, 21279, 32768,
+];
+
+/// Maps an LE Audio level onto a Q15 gain along the same decibel curve [`device_volume_setting`]
+/// uses, so moving volume between the host and the device does not change the feel of the control.
+#[must_use]
+pub fn host_gain_q15(level: u8) -> u16 {
+    let segments = (HOST_GAIN_Q15.len() - 1) as u32;
+    let scaled = u32::from(level) * segments;
+    let segment = (scaled / u32::from(MAXIMUM_LEVEL)) as usize;
+    let Some(&lower) = HOST_GAIN_Q15.get(segment) else {
+        return UNITY_GAIN_Q15;
+    };
+    let Some(&upper) = HOST_GAIN_Q15.get(segment + 1) else {
+        return lower;
+    };
+    // Interpolate linearly between the two nearest table entries.
+    let position = scaled % u32::from(MAXIMUM_LEVEL);
+    let step = u32::from(upper - lower) * position / u32::from(MAXIMUM_LEVEL);
+    (u32::from(lower) + step) as u16
+}
+
+/// Maps an LE Audio level onto a device volume in 1/256 dB, clamped to the range the device
+/// reported.
+///
+/// The mapping is linear in decibels. Interpolating across the device's whole reported range, or
+/// applying an amplitude-style taper on top of a value that is already logarithmic, leaves the
+/// lower two thirds of the scale inaudible.
+#[must_use]
+pub fn device_volume_setting(level: u8, minimum_db_256: i16, maximum_db_256: i16) -> i16 {
+    if level == 0 {
+        return VOLUME_SILENCE;
+    }
+    let maximum = i32::from(maximum_db_256);
+    let minimum = i32::from(minimum_db_256);
+    // Never reach below the device's own floor, but do not follow it all the way down either.
+    let floor = (maximum - VOLUME_RANGE_DB * 256).max(minimum);
+    let setting = floor + (maximum - floor) * i32::from(level) / i32::from(MAXIMUM_LEVEL);
+    setting.clamp(minimum, maximum) as i16
+}
+
 /// USB Audio specification generation used by a playback alternate setting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AudioClassVersion {
@@ -934,6 +994,86 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Decibels for a Q15 gain, used to assert the host curve rather than restating the table.
+    fn gain_db(gain_q15: u16) -> f64 {
+        20.0 * f64::from(gain_q15).log10() - 20.0 * f64::from(UNITY_GAIN_Q15).log10()
+    }
+
+    #[test]
+    fn host_gain_spans_the_usable_range_without_a_silent_lower_half() {
+        assert_eq!(host_gain_q15(MAXIMUM_LEVEL), UNITY_GAIN_Q15);
+        // The midpoint must land near half the range in decibels, not near silence. The squared
+        // taper this replaced put 50% at about -95 dB, which was inaudible.
+        assert!((gain_db(host_gain_q15(128)) + 30.0).abs() < 1.0);
+        assert!((gain_db(host_gain_q15(204)) + 12.0).abs() < 1.0);
+        assert!((gain_db(host_gain_q15(0)) + 60.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn host_gain_is_monotonic_across_every_level() {
+        let mut previous = 0;
+        for level in 0..=MAXIMUM_LEVEL {
+            let gain = host_gain_q15(level);
+            assert!(gain >= previous, "level {level} lowered the gain");
+            assert!(gain <= UNITY_GAIN_Q15, "level {level} exceeded unity");
+            previous = gain;
+        }
+    }
+
+    #[test]
+    fn host_gain_tracks_the_decibel_curve_between_table_entries() {
+        // Interpolation error has to stay well under what a listener notices.
+        for level in 1..=MAXIMUM_LEVEL {
+            let expected = -f64::from(VOLUME_RANGE_DB as i32) * (1.0 - f64::from(level) / 255.0);
+            let error = (gain_db(host_gain_q15(level)) - expected).abs();
+            assert!(error < 0.4, "level {level} was off by {error} dB");
+        }
+    }
+
+    #[test]
+    fn device_volume_is_linear_in_decibels_over_the_usable_range() {
+        // A device reporting a -127.5 dB floor must not have its whole floor mapped onto the
+        // scale, or most of the control is inaudible.
+        let minimum = -127 * 256;
+        let maximum = 0;
+
+        assert_eq!(device_volume_setting(MAXIMUM_LEVEL, minimum, maximum), 0);
+        assert_eq!(device_volume_setting(128, minimum, maximum), -30 * 256 + 15);
+        assert_eq!(device_volume_setting(204, minimum, maximum), -12 * 256);
+    }
+
+    #[test]
+    fn device_volume_never_leaves_the_reported_range() {
+        for (minimum, maximum) in [(-127 * 256, 0), (-40 * 256, 0), (-20 * 256, 10 * 256), (-256, 0)] {
+            for level in 1..=MAXIMUM_LEVEL {
+                let setting = device_volume_setting(level, minimum, maximum);
+                assert!(
+                    (minimum..=maximum).contains(&i32::from(setting)),
+                    "level {level} produced {setting} outside {minimum}..={maximum}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn device_volume_respects_a_narrow_device_range() {
+        // A device that only attenuates by 20 dB must still reach both of its own limits.
+        let (minimum, maximum) = (-20 * 256, 0);
+
+        assert_eq!(device_volume_setting(MAXIMUM_LEVEL, minimum, maximum), maximum as i16);
+        assert_eq!(
+            device_volume_setting(1, minimum, maximum),
+            (minimum + 20 * 256 / 255) as i16
+        );
+    }
+
+    #[test]
+    fn level_zero_is_silence_on_both_paths() {
+        assert_eq!(device_volume_setting(0, -127 * 256, 0), VOLUME_SILENCE);
+        // The host path expresses silence as a zero gain instead, which the caller applies.
+        assert!(gain_db(host_gain_q15(0)) < -50.0);
     }
 
     #[test]
