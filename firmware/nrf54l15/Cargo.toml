@@ -1,0 +1,57 @@
+[package]
+name = "ble-audio-nrf54l15"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+publish = false
+
+[workspace]
+resolver = "2"
+
+[dependencies]
+ble-audio-link = { path = "../../crates/audio-link" }
+bt-hci = { version = "0.10", default-features = false, features = ["defmt"] }
+cortex-m = "0.7.6"
+cortex-m-rt = "0.7"
+defmt = "1"
+defmt-rtt = "1"
+embassy-executor = { version = "0.10", default-features = false, features = ["platform-cortex-m", "executor-thread", "executor-interrupt", "defmt"] }
+embassy-futures = "0.1.1"
+embassy-nrf = { version = "0.11", default-features = false, features = ["defmt", "time-driver-grtc", "gpiote", "unstable-pac", "rt", "nrf54l15-app-s"] }
+embassy-sync = { version = "0.8", features = ["defmt"] }
+embassy-time = { version = "0.5", default-features = false, features = ["defmt", "defmt-timestamp-uptime"] }
+embedded-alloc = "0.6"
+embedded-storage = "0.3"
+heapless = "0.9"
+nrf-mpsl = { git = "https://github.com/LegitCamper/nrf-sdc", rev = "478e1f5c5ba2e6c749c06f3a2bf290784194b415", default-features = false, features = ["defmt", "critical-section-impl"] }
+nrf-sdc = { git = "https://github.com/LegitCamper/nrf-sdc", rev = "478e1f5c5ba2e6c749c06f3a2bf290784194b415", default-features = false, features = ["defmt", "peripheral", "central", "nrf54l15-app-s"] }
+panic-probe = { version = "1", features = ["print-defmt"] }
+static_cell = "2"
+trouble-audio = { git = "https://github.com/LegitCamper/trouble_audio", rev = "894a43024f40f150469c83d5df58d81781044a3c", package = "trouble_audio", default-features = false, features = ["defmt", "nrf-sdc"] }
+trouble-audio-example-apps = { git = "https://github.com/LegitCamper/trouble_audio", rev = "894a43024f40f150469c83d5df58d81781044a3c", package = "trouble-audio-example-apps", features = ["defmt"] }
+trouble-host = { git = "https://github.com/LegitCamper/trouble", rev = "d30c550f4022c3dbf61a27c49b84873d51dc64fd", features = ["derive", "scan", "gatt", "central", "security", "iso", "default-packet-pool"] }
+
+[lints.rust]
+future-incompatible = "warn"
+missing-docs = "warn"
+nonstandard-style = "deny"
+
+[profile.release]
+codegen-units = 1
+debug = 2
+lto = true
+opt-level = "s"
+
+[patch.crates-io]
+bt-hci = { git = "https://github.com/LegitCamper/bt-hci", rev = "48337e506a15d7665f5d4caa4d4613388b2e7c64" }
+bt-hci-transport = { git = "https://github.com/LegitCamper/bt-hci", rev = "48337e506a15d7665f5d4caa4d4613388b2e7c64" }
+embassy-embedded-hal = { git = "https://github.com/embassy-rs/embassy.git", rev = "03c826f2544220cb44b2dec05f5d636a80d39382" }
+embassy-executor = { git = "https://github.com/embassy-rs/embassy.git", rev = "03c826f2544220cb44b2dec05f5d636a80d39382" }
+embassy-futures = { git = "https://github.com/embassy-rs/embassy.git", rev = "03c826f2544220cb44b2dec05f5d636a80d39382" }
+embassy-hal-internal = { git = "https://github.com/embassy-rs/embassy.git", rev = "03c826f2544220cb44b2dec05f5d636a80d39382" }
+embassy-nrf = { git = "https://github.com/embassy-rs/embassy.git", rev = "03c826f2544220cb44b2dec05f5d636a80d39382" }
+embassy-sync = { git = "https://github.com/embassy-rs/embassy.git", rev = "03c826f2544220cb44b2dec05f5d636a80d39382" }
+embassy-time = { git = "https://github.com/embassy-rs/embassy.git", rev = "03c826f2544220cb44b2dec05f5d636a80d39382" }
+embassy-time-driver = { git = "https://github.com/embassy-rs/embassy.git", rev = "03c826f2544220cb44b2dec05f5d636a80d39382" }
+embassy-time-queue-utils = { git = "https://github.com/embassy-rs/embassy.git", rev = "03c826f2544220cb44b2dec05f5d636a80d39382" }

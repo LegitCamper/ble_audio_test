@@ -1,0 +1,7 @@
+/target/
+**/target/
+*.uf2
+*.elf
+*.bin
+*.hex
+.probe-rs/

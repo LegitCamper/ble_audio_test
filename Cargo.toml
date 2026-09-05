@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/audio-link",
+]
+default-members = ["crates/audio-link"]
+exclude = ["firmware/nrf54l15", "firmware/xiao-rp2350"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+future-incompatible = "warn"
+missing-docs = "warn"
+nonstandard-style = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = 10 }
+pedantic = { level = "warn", priority = 5 }
+perf = { level = "deny", priority = 10 }
+
+[profile.release]
+codegen-units = 1
+debug = 2
+lto = true
+opt-level = "s"

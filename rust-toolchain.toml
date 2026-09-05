@@ -1,0 +1,5 @@
+[toolchain]
+channel = "nightly-2025-12-11"
+components = ["clippy", "rust-src", "rustfmt"]
+targets = ["thumbv6m-none-eabi", "thumbv8m.main-none-eabihf"]
+profile = "minimal"

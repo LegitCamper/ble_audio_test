@@ -1,0 +1,8 @@
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[target.thumbv8m.main-none-eabihf]
+runner = "probe-rs run --chip nRF54L15"
+
+[env]
+DEFMT_LOG = "trouble_host=info,trouble_audio=debug,ble_audio_nrf54l15=debug,info"

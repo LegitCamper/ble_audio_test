@@ -1,0 +1,9 @@
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[target.thumbv8m.main-none-eabihf]
+runner = ".cargo/deploy-uf2.sh"
+rustflags = ["-C", "target-cpu=cortex-m33"]
+
+# [env]
+# DEFMT_LOG = "ble_audio_xiao_rp2350=debug,info"
