@@ -6,7 +6,7 @@ This repository contains a two-MCU stereo LE Audio path:
 LE Audio source
   -> two 48 kHz / 10 ms mono CIS/ASE streams (front left + front right)
   -> nRF54L15 (HCI-sequence-pair left/right without decoding)
-  -> two channel-tagged LC3 frames retaining the HCI sequence and optional timestamp
+  -> two channel-tagged LC3 frames carrying an aligned HCI sequence and optional timestamp
   -> 1 Mbaud UART (COBS + metadata + CRC-16)
   -> XIAO RP2350 core 1 (two-channel LC3 decoder writing planar S16LE)
   -> zero-copy bounded PCM ring
@@ -33,13 +33,15 @@ them would select incompatible global time drivers.
 ## What is implemented
 
 The nRF firmware advertises the known-working pair of 48 kHz sink ASEs, receives both LC3 streams,
-and retains short per-channel FIFOs while pairing left/right frames by the controller-provided HCI
-ISO sequence. The HCI timestamp is retained when present; otherwise the receive timestamp is used.
-Invalid, fragmented, and length-mismatched SDUs are rejected before forwarding. This preserves
-ordering and resynchronizes after a loss even when the controller delivers several frames from one
-CIS in a burst. A dedicated UART executor sends each pair together and overlaps DMA output with ISO
-reception. The advertised PAC record allows up to 155 octets per codec frame; two maximum frames
-every 10 ms consume less than 36% of a 1 Mbaud 8-N-1 link after framing.
+and retains short per-channel FIFOs. Because each CIS has an independent HCI ISO sequence origin,
+the first timestamp-matched pair establishes a fixed cross-CIS sequence offset. Subsequent frames
+are paired by their aligned sequence. The HCI timestamp is retained when present; otherwise the
+receive timestamp is used. Invalid, fragmented, and length-mismatched SDUs are rejected before
+forwarding. This preserves ordering and resynchronizes after a loss even when the controller
+delivers several frames from one CIS in a burst. A dedicated UART executor sends each pair together
+and overlaps DMA output with ISO reception. The advertised PAC record allows up to 155 octets per
+codec frame; two maximum frames every 10 ms consume less than 36% of a 1 Mbaud 8-N-1 link after
+framing.
 
 The RP2350 dedicates core 1 to UART parsing and a two-channel native Rust `lc3-codec` decoder.
 Matching left/right frames decode directly into planar channels in the final PCM block. The block
@@ -152,7 +154,7 @@ is reaching successful USB audio writes.
 ## Current constraints
 
 - The source must establish two 48 kHz, 10 ms mono ASEs allocated front left and front right.
-- Left/right frames with different HCI ISO sequence numbers are not paired.
+- Initial left/right alignment requires timestamps or local receipt times within 5 ms.
 - DAC playback is fixed to stereo S16LE at 48 kHz; 24/32-bit alternates and microphone capture are
   ignored.
 - There is no UART return channel, flow control, retransmission, or sample-rate correction between

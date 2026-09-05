@@ -398,8 +398,16 @@ impl<M: RawMutex, const MAX_ASES: usize> EventHandler for CisManager<M, MAX_ASES
             const PACKET_STATUS_SHIFT: u32 = 14;
             let packet_status = header.iso_sdu_len >> PACKET_STATUS_SHIFT;
             let declared_length = usize::from(header.iso_sdu_len & ISO_SDU_LENGTH_MASK);
+            if packet_status == 2 {
+                debug!("[cis] controller reported lost ISO SDU sequence={}", header.sequence_num);
+                return;
+            }
             if packet_status != 0 {
-                warn!("[cis] ISO SDU status={} is not valid, dropping", packet_status);
+                warn!(
+                    "[cis] ISO SDU sequence={} has invalid status={}, dropping",
+                    header.sequence_num,
+                    packet_status
+                );
                 return;
             }
             if declared_length != packet.data().len() {
@@ -647,7 +655,7 @@ mod tests {
     /// Hand-encodes a single, complete, non-timestamped HCI ISO data packet - mirrors the
     /// approach used to test the receive-path plumbing in the `trouble` fork itself, since
     /// `IsoPacket` has no public constructor other than parsing from wire bytes.
-    fn iso_data_packet(cis_handle: u16, sequence_number: u16, payload: &[u8]) -> AVec<u8> {
+    fn iso_data_packet(cis_handle: u16, sequence_number: u16, packet_status: u16, payload: &[u8]) -> AVec<u8> {
         const PB_COMPLETE: u16 = 0b10;
         let handle_word = (cis_handle & 0x0fff) | (PB_COMPLETE << 12);
         let data_load_len = 4 + payload.len();
@@ -655,7 +663,8 @@ mod tests {
         out.extend_from_slice(&handle_word.to_le_bytes());
         out.extend_from_slice(&(data_load_len as u16).to_le_bytes());
         out.extend_from_slice(&sequence_number.to_le_bytes());
-        out.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        let iso_sdu_length = (payload.len() as u16) | (packet_status << 14);
+        out.extend_from_slice(&iso_sdu_length.to_le_bytes());
         out.extend_from_slice(payload);
         out
     }
@@ -712,7 +721,7 @@ mod tests {
         let mut frame = [0u8; 100];
         encoder.encode(&pcm_in, &mut frame).unwrap();
 
-        let raw = iso_data_packet(0x11, 0, &frame);
+        let raw = iso_data_packet(0x11, 0, 0, &frame);
         let (packet, rest) = IsoPacket::from_hci_bytes(&raw).unwrap();
         assert!(rest.is_empty());
         manager.on_iso_data(&packet);
@@ -780,7 +789,7 @@ mod tests {
         let pcm_in: AVec<i16> = (0..encoder.samples_per_frame).map(|i| (i as i16).wrapping_mul(37)).collect();
         let mut frame = [0u8; 100];
         encoder.encode(&pcm_in, &mut frame).unwrap();
-        let raw = iso_data_packet(0x12, 0, &frame);
+        let raw = iso_data_packet(0x12, 0, 0, &frame);
         let (packet, rest) = IsoPacket::from_hci_bytes(&raw).unwrap();
         assert!(rest.is_empty());
         manager.on_iso_data(&packet);
@@ -860,7 +869,7 @@ mod tests {
         let _ = manager.actions.try_receive(); // SetupDataPath
 
         let payload = [0xC3u8; 100];
-        let raw = iso_data_packet(0x11, 42, &payload);
+        let raw = iso_data_packet(0x11, 42, 0, &payload);
         let (packet, _) = IsoPacket::from_hci_bytes(&raw).unwrap();
         manager.on_iso_data(&packet);
 
@@ -872,5 +881,10 @@ mod tests {
         assert_eq!(frame.sequence_number, 42);
         assert_eq!(frame.timestamp_us, None);
         assert_eq!(&frame.frame[..], &payload[..]);
+
+        let lost = iso_data_packet(0x11, 43, 2, &[]);
+        let (packet, _) = IsoPacket::from_hci_bytes(&lost).unwrap();
+        manager.on_iso_data(&packet);
+        assert!(manager.frames_out.try_receive().is_err());
     }
 }

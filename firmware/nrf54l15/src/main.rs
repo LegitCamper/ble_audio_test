@@ -84,6 +84,8 @@ fn build_sdc<'d, const N: usize>(
 }
 
 const PENDING_FRAMES_PER_CHANNEL: usize = 8;
+const MAXIMUM_INITIAL_ALIGNMENT_SKEW_US: u32 = 5_000;
+const STREAM_IDLE_RESET_US: u32 = 100_000;
 
 struct StereoEncodedPair {
     left: EncodedFrame,
@@ -94,6 +96,8 @@ struct PendingLc3 {
     ase_id: u8,
     sequence: u16,
     timestamp_us: u32,
+    receipt_timestamp_us: u32,
+    timestamp_from_controller: bool,
     frame: Lc3Frame,
 }
 
@@ -101,11 +105,24 @@ struct PendingLc3 {
 struct StereoPairer {
     left: Deque<PendingLc3, PENDING_FRAMES_PER_CHANNEL>,
     right: Deque<PendingLc3, PENDING_FRAMES_PER_CHANNEL>,
+    right_to_left_sequence_offset: Option<u16>,
+    last_receipt_timestamp_us: Option<u32>,
     discarded: u32,
 }
 
 impl StereoPairer {
     fn push(&mut self, channel: Channel, pending: PendingLc3) -> Option<(PendingLc3, PendingLc3)> {
+        if self
+            .last_receipt_timestamp_us
+            .is_some_and(|last| pending.receipt_timestamp_us.wrapping_sub(last) > STREAM_IDLE_RESET_US)
+        {
+            self.left.clear();
+            self.right.clear();
+            self.right_to_left_sequence_offset = None;
+            defmt::info!("stereo sequence alignment reset after stream idle");
+        }
+        self.last_receipt_timestamp_us = Some(pending.receipt_timestamp_us);
+
         let queue = match channel {
             Channel::Left => &mut self.left,
             Channel::Right => &mut self.right,
@@ -121,17 +138,55 @@ impl StereoPairer {
             let (Some(left), Some(right)) = (self.left.front(), self.right.front()) else {
                 return None;
             };
-            if left.sequence == right.sequence {
+
+            let sequence_offset = if let Some(offset) = self.right_to_left_sequence_offset {
+                offset
+            } else {
+                let (left_timestamp, right_timestamp) = alignment_timestamps(left, right);
+                let left_after_right = left_timestamp.wrapping_sub(right_timestamp);
+                let skew_us = left_after_right.min(right_timestamp.wrapping_sub(left_timestamp));
+                if skew_us > MAXIMUM_INITIAL_ALIGNMENT_SKEW_US {
+                    self.discarded = self.discarded.wrapping_add(1);
+                    if left_after_right < 0x8000_0000 {
+                        let _ = self.right.pop_front();
+                    } else {
+                        let _ = self.left.pop_front();
+                    }
+                    continue;
+                }
+
+                let offset = left.sequence.wrapping_sub(right.sequence);
+                self.right_to_left_sequence_offset = Some(offset);
+                defmt::info!(
+                    "stereo sequence alignment left={} right={} right_offset={} timestamp_skew_us={}",
+                    left.sequence,
+                    right.sequence,
+                    offset,
+                    skew_us
+                );
+                offset
+            };
+
+            let aligned_right_sequence = right.sequence.wrapping_add(sequence_offset);
+            if left.sequence == aligned_right_sequence {
                 return Some((self.left.pop_front()?, self.right.pop_front()?));
             }
 
             self.discarded = self.discarded.wrapping_add(1);
-            if sequence_is_after(left.sequence, right.sequence) {
+            if sequence_is_after(left.sequence, aligned_right_sequence) {
                 let _ = self.right.pop_front();
             } else {
                 let _ = self.left.pop_front();
             }
         }
+    }
+}
+
+fn alignment_timestamps(left: &PendingLc3, right: &PendingLc3) -> (u32, u32) {
+    if left.timestamp_from_controller && right.timestamp_from_controller {
+        (left.timestamp_us, right.timestamp_us)
+    } else {
+        (left.receipt_timestamp_us, right.receipt_timestamp_us)
     }
 }
 
@@ -201,10 +256,13 @@ async fn forward_lc3(
 
         let receipt_micros = Instant::now().as_micros();
         let receipt_timestamp_us = u32::try_from(receipt_micros & u64::from(u32::MAX)).unwrap_or_default();
+        let timestamp_from_controller = raw.timestamp_us.is_some();
         let pending = PendingLc3 {
             ase_id: raw.ase_id,
             sequence: raw.sequence_number,
             timestamp_us: raw.timestamp_us.unwrap_or(receipt_timestamp_us),
+            receipt_timestamp_us,
+            timestamp_from_controller,
             frame: raw.frame,
         };
         received_frames = received_frames.wrapping_add(1);
