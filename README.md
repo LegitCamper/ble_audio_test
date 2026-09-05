@@ -10,8 +10,8 @@ LE Audio source
   -> 1 Mbaud UART (COBS + metadata + CRC-16)
   -> XIAO RP2350 core 1 (two-channel LC3 decoder writing planar S16LE)
   -> zero-copy bounded PCM ring
-  -> XIAO RP2350 core 0 (direct USB-DPRAM fill + Full-Speed UAC2 host)
-  -> TTGK TE-C USB DAC (3302:43e8), 48 kHz S16LE stereo
+  -> XIAO RP2350 core 0 (direct USB-DPRAM fill + Full-Speed UAC1/UAC2 host)
+  -> class-compliant USB DAC, 48 kHz S16LE stereo
 ```
 
 The USB host, DAC configuration, serial link, and earlier mono audio path have been exercised on
@@ -21,8 +21,11 @@ validation.
 ## Repository layout
 
 - `crates/audio-link`: allocator-free, corruption-resynchronizing UART protocol shared by both MCUs
-- `firmware/nrf54l15`: Trouble Audio unicast sink and selected-channel LC3 transmitter
-- `firmware/xiao-rp2350`: dual-core LC3 decoder/USB bridge and TE-C-specific UAC2 host
+- `crates/uac-descriptor`: allocation-free USB Audio descriptor parsing, playback-path selection,
+  and feature-unit volume discovery
+- `firmware/nrf54l15`: Trouble Audio unicast sink, Volume Control Service, and selected-channel
+  LC3 transmitter
+- `firmware/xiao-rp2350`: dual-core LC3 decoder and descriptor-driven USB Audio host
 - `docs/serial-protocol.md`: exact version-1 wire format
 
 The firmware directories are separate Cargo workspaces. The nRF firmware pins its `trouble_audio`
@@ -66,15 +69,29 @@ FPU, while Hazard3 does not. The pinned Embassy RP USB-host HAL is also Cortex-M
 specific pipeline to RISC-V now would require a different USB-host stack and would make LC3's `f32`
 work software-emulated, so M33 is the useful performance target for LC3 decoding.
 
-The USB class remains intentionally narrow. It accepts only VID:PID `3302:43e8`, UAC2 playback
-interface 2 alternate 1, stereo PCM, 16-bit subslots, and Full Speed. It selects the 48 kHz clock on
-entity 1, sends PCM to the asynchronous isochronous OUT endpoint, and follows the four-byte 16.16
-explicit feedback endpoint. Because UAC2 advertises supported rates through the clock entity rather
-than the streaming descriptors, the host queries the Sampling Frequency Control's `RANGE`, then
-reads `CUR` back after setting it, and refuses the device if 48 kHz is missing or does not stick. A
-device that stalls `RANGE` outright is still tried. The Embassy host fork rejects isochronous
-channel allocation at runtime, so `iso.rs` supplies a direct RP2 EPX transaction path paced from
-USB SOF.
+The USB host discovers any Full-Speed, class-compliant UAC1 or UAC2 alternate setting that exposes
+48 kHz stereo signed 16-bit PCM. Interface numbers, alternate settings, endpoint addresses, UAC2
+control interfaces, and clock-source entities all come from descriptors rather than device-specific
+constants. UAC1 discrete and continuous sample-rate declarations are supported. Fixed, adaptive,
+and synchronous endpoints run at the nominal 48 frames per USB frame; asynchronous endpoints must
+provide a three-byte 10.14 or four-byte 16.16 explicit-feedback endpoint. Selection lives in
+`crates/uac-descriptor` rather than in the firmware so it is exercised by host tests, including
+truncated and length-corrupted descriptors that must be rejected instead of faulting the host. UAC2 clock controls are
+read before modification, read-only 48 kHz clocks are accepted, and writable clocks are verified
+after configuration. Volume originates on the nRF, which exposes the LE Audio Volume Control Service so the phone owns
+the slider. Each Volume Control Point write is read back from the Volume State characteristic and
+forwarded to the RP2350 as a kind-3 serial frame, so the value that crosses the link is the one the
+profile state machine settled on, including its clamping of relative steps. Mute travels separately
+from the level, because unmuting has to restore the previous level rather than zero.
+
+On the USB side, volume has exactly one owner, chosen once at configure time. If the
+device exposes a feature unit fed by this stream that claims a writable volume control, the host
+probes its range and, when that succeeds, hands volume to the DAC. A device that advertises no such
+control, or advertises one whose probe stalls, leaves the RP2350 applying a Q15 gain to each sample
+on the way into USB DPRAM instead. Because the choice is made before streaming starts and never
+changes, attenuation is never applied twice. The Embassy host fork
+rejects isochronous channel allocation at runtime, so `iso.rs` supplies a direct RP2 EPX transaction
+path paced from USB SOF.
 
 ## Wiring
 
@@ -99,7 +116,7 @@ USB connector for flashing or serial while it is wired as the DAC host; use SWD 
 The pinned toolchain and targets are declared in `rust-toolchain.toml`.
 
 ```sh
-# Shared protocol tests and lint
+# Shared protocol and USB descriptor tests, plus lint
 cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
 
@@ -132,12 +149,12 @@ is reaching successful USB audio writes.
 
 ## Required hardware gates
 
-1. **Check the DAC at Full Speed.** Connect the DAC through a USB 1.1 Full-Speed hub (or otherwise
-   force Full Speed) and capture `lsusb -v`; interface 2 alt 1 must expose stereo 16-bit PCM, an
-   isochronous OUT endpoint, and a four-byte feedback IN endpoint. Also confirm the clock source
-   on entity 1 accepts 48 kHz: `lsusb -v` does not list UAC2 rates, so read them from the device
-   with a Sampling Frequency Control `RANGE` request, or watch the RTT `DAC clock subrange` lines
-   this firmware logs at configure time.
+1. **Check each DAC at Full Speed.** Connect it through a USB 1.1 Full-Speed hub (or otherwise force
+   Full Speed) and capture `lsusb -v`. It must expose a UAC1 or UAC2 playback alternate with stereo
+   16-bit PCM at 48 kHz and an isochronous OUT packet capacity of at least 192 bytes. Asynchronous
+   OUT endpoints must also expose a three- or four-byte explicit-feedback IN endpoint. Watch the RTT
+   `USB Audio configured` line to confirm the selected UAC version, interface, alternate, and
+   endpoint addresses.
 2. **Validate the host fixture.** Confirm 5 V VBUS, Type-C role resistors, current limiting, and no
    backfeed before attaching the XIAO and DAC together.
 3. **Measure RP2350 decode timing and cadence.** RTT reports `max_stereo_decode_us`,
@@ -150,13 +167,19 @@ is reaching successful USB audio writes.
    not keeping up.
 5. **Validate EPX isochronous traffic.** Watch USB `underflows` and transaction errors during the
    first physical-device run.
+6. **Confirm the volume owner and path.** The RTT `volume_owner=` field reports which side applies
+   volume. Move the phone's volume slider and confirm a `sent volume` line on the nRF and a matching
+   `volume received` line on the RP2350. A DAC that advertises a feature unit but fails the probe
+   must fall back to `volume_owner=rp2350` rather than losing volume control entirely.
 
 ## Current constraints
 
 - The source must establish two 48 kHz, 10 ms mono ASEs allocated front left and front right.
 - Initial left/right alignment requires timestamps or local receipt times within 5 ms.
-- DAC playback is fixed to stereo S16LE at 48 kHz; 24/32-bit alternates and microphone capture are
-  ignored.
+- DAC playback requires Full-Speed UAC1/UAC2 stereo S16LE at 48 kHz; 24/32-bit, High-Speed-only,
+  implicit-feedback-only, vendor-specific, and microphone interfaces are ignored.
+- Volume is not persisted across power cycles, so the sink reports its factory default on every
+  boot and the Volume Flags characteristic stays clear.
 - There is no UART return channel, flow control, retransmission, or sample-rate correction between
   MCUs. CRC/COBS detects damage and restores frame boundaries; USB underflow produces silence.
 - Disconnect/reconnect and malformed traffic paths are handled, but the stereo decoder and

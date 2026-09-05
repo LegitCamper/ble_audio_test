@@ -12,11 +12,12 @@ use core::cell::RefCell;
 use core::mem::MaybeUninit;
 
 use ble_audio_link::{
-    AudioEncoding, Channel, EncodedFrame, FrameDuration as LinkFrameDuration, FrameFlags, FrameMeta, encode,
+    AudioEncoding, Channel, EncodedFrame, FrameDuration as LinkFrameDuration, FrameFlags, FrameMeta, VolumeCommand,
+    encode,
 };
 use defmt::unwrap;
 use embassy_executor::{InterruptExecutor, Spawner};
-use embassy_futures::select::select;
+use embassy_futures::select::{Either, select};
 use embassy_nrf::gpio::{Level, Output, OutputDrive};
 use embassy_nrf::interrupt;
 use embassy_nrf::interrupt::{InterruptExt, Priority};
@@ -196,6 +197,11 @@ fn sequence_is_after(sequence: u16, reference: u16) -> bool {
 }
 
 static LC3_TX_QUEUE: AsyncChannel<CriticalSectionRawMutex, StereoEncodedPair, 4> = AsyncChannel::new();
+/// Volume settings waiting to be forwarded to the RP2350.
+///
+/// Kept separate from [`LC3_TX_QUEUE`] and holding the two-byte command rather than an encoded
+/// frame, so a volume change neither displaces queued audio nor costs a full wire-frame buffer.
+static VOLUME_TX_QUEUE: AsyncChannel<CriticalSectionRawMutex, VolumeCommand, 2> = AsyncChannel::new();
 static UART_EXECUTOR: InterruptExecutor = InterruptExecutor::new();
 
 #[interrupt]
@@ -203,6 +209,20 @@ unsafe fn SWI01() {
     // SAFETY: this handler is the sole interrupt entry point for `UART_EXECUTOR`, which is
     // started before SWI01 is enabled.
     unsafe { UART_EXECUTOR.on_interrupt() }
+}
+
+/// Queues a volume setting for the RP2350.
+///
+/// Dropping the setting when the queue is full is safe: only the newest value matters, and the
+/// queue only fills if the UART is already wedged.
+fn send_volume(command: VolumeCommand) {
+    if VOLUME_TX_QUEUE.try_send(command).is_err() {
+        defmt::warn!(
+            "volume queue full; dropped level={} muted={}",
+            command.level,
+            command.muted
+        );
+    }
 }
 
 fn channel_from_allocation(allocation: Option<AudioLocation>) -> Option<Channel> {
@@ -220,15 +240,45 @@ fn channel_from_allocation(allocation: Option<AudioLocation>) -> Option<Channel>
 #[embassy_executor::task]
 async fn uart_tx_task(mut uart: UarteTx<'static>) -> ! {
     let mut transmitted_pairs = 0_u32;
+    let mut volume_sequence = 0_u16;
     loop {
-        let pair = LC3_TX_QUEUE.receive().await;
-        if uart.write(pair.left.as_bytes()).await.is_err() || uart.write(pair.right.as_bytes()).await.is_err() {
-            defmt::warn!("stereo LC3 UART write failed");
-            continue;
-        }
-        transmitted_pairs = transmitted_pairs.wrapping_add(1);
-        if transmitted_pairs == 1 || transmitted_pairs % 200 == 0 {
-            defmt::info!("transmitted LC3 stereo pairs={}", transmitted_pairs);
+        // Neither branch consumes its item until it is selected, so losing the race cannot drop a
+        // queued value.
+        match select(LC3_TX_QUEUE.receive(), VOLUME_TX_QUEUE.receive()).await {
+            Either::First(pair) => {
+                if uart.write(pair.left.as_bytes()).await.is_err() || uart.write(pair.right.as_bytes()).await.is_err() {
+                    defmt::warn!("stereo LC3 UART write failed");
+                    continue;
+                }
+                transmitted_pairs = transmitted_pairs.wrapping_add(1);
+                if transmitted_pairs == 1 || transmitted_pairs % 200 == 0 {
+                    defmt::info!("transmitted LC3 stereo pairs={}", transmitted_pairs);
+                }
+            }
+            Either::Second(command) => {
+                let meta = FrameMeta {
+                    encoding: AudioEncoding::Volume,
+                    // A volume frame belongs to no stream, so the audio fields carry neutral
+                    // values; only the sequence is meaningful, for spotting a dropped update.
+                    channel: Channel::Unknown,
+                    ase_id: 0,
+                    sequence: volume_sequence,
+                    timestamp_us: Instant::now().as_micros() as u32,
+                    sample_rate_hz: 48_000,
+                    frame_duration: LinkFrameDuration::Millis10,
+                    flags: FrameFlags::empty(),
+                };
+                volume_sequence = volume_sequence.wrapping_add(1);
+                let Ok(frame) = encode(meta, &command.to_payload()) else {
+                    defmt::warn!("could not encode a volume frame");
+                    continue;
+                };
+                if uart.write(frame.as_bytes()).await.is_err() {
+                    defmt::warn!("volume UART write failed");
+                    continue;
+                }
+                defmt::info!("sent volume level={} muted={}", command.level, command.muted);
+            }
         }
     }
 }

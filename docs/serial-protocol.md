@@ -7,7 +7,7 @@ fixed storage, so corrupt input cannot grow memory use.
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 1 | version (`1`) |
-| 1 | 1 | encoding (`1` = LC3, `2` = packed signed 12-bit little-endian mono PCM) |
+| 1 | 1 | kind (`1` = LC3, `2` = packed signed 12-bit little-endian mono PCM, `3` = volume) |
 | 2 | 1 | flags: bit 0 discontinuity, bit 1 stream start |
 | 3 | 1 | channel: `0` left, `1` right, `2` mono, `255` unknown |
 | 4 | 1 | ASE identifier |
@@ -29,6 +29,13 @@ channel alignment.
 Encoding 2 remains supported for compatibility with the earlier mono path. It contains exactly 480
 samples in 720 bytes: each three-byte group stores two signed 12-bit two's-complement samples, with
 the first sample in bits 0..11 and the second in bits 12..23.
+
+Kind 3 carries a rendering volume rather than audio, in exactly two bytes: the Volume Control
+Service level (`0`..=`255`) followed by a flags byte whose bit 0 is the muted state. Mute travels
+separately from the level because unmuting has to restore the previous level rather than zero.
+Unknown flag bits are ignored. The remaining header fields are not used by this kind. A receiver
+that predates kind 3 rejects it as an unsupported kind and drops the frame, so no version bump was
+needed.
 
 The receiver drops malformed/version-mismatched/CRC-failed messages. If bytes accumulate beyond one
 maximum frame, it ignores input through the next zero delimiter and then resumes normally.

@@ -2,7 +2,9 @@
 
 use core::sync::atomic::Ordering;
 
-use ble_audio_link::{AudioEncoding, Channel, DecodedFrame, FrameDuration as LinkFrameDuration, StreamDecoder};
+use ble_audio_link::{
+    AudioEncoding, Channel, DecodedFrame, FrameDuration as LinkFrameDuration, StreamDecoder, VolumeCommand,
+};
 use embassy_rp::spinlock_mutex::SpinlockRawMutex;
 use embassy_rp::uart::BufferedUartRx;
 use embassy_sync::zerocopy_channel::{Channel as ZeroCopyChannel, Receiver, Sender};
@@ -11,7 +13,7 @@ use embedded_io_async::Read;
 use lc3_codec::common::complex::{Complex, Scaler};
 use lc3_codec::common::config::{FrameDuration as CodecFrameDuration, SamplingFrequency};
 use lc3_codec::decoder::lc3_decoder::Lc3Decoder;
-use portable_atomic::AtomicU8;
+use portable_atomic::{AtomicU8, AtomicU16};
 use static_cell::StaticCell;
 
 /// Sample rate of the received LC3 streams and decoded PCM.
@@ -28,6 +30,13 @@ const DECODER_BUFFER_LENGTHS: (usize, usize) =
     Lc3Decoder::<DECODER_CHANNELS>::calc_working_buffer_lengths(CODEC_FRAME_DURATION, CODEC_SAMPLE_RATE);
 
 static AUDIO_PROGRESS: AtomicU8 = AtomicU8::new(AudioProgress::WaitingForUart as u8);
+/// Latest volume published by core 1 for core 0 to apply, or [`NO_VOLUME`] if the source has not
+/// sent one. Packing it into a single word keeps level and mute inseparable across cores, so the
+/// USB task can never observe a new level with a stale mute.
+static VOLUME: AtomicU16 = AtomicU16::new(NO_VOLUME);
+/// Sentinel meaning no volume has been received; distinguishable from level 0 with mute clear.
+const NO_VOLUME: u16 = 0xffff;
+const VOLUME_MUTED_BIT: u16 = 1 << 8;
 static DECODER_SCALER_MEMORY: StaticCell<[Scaler; DECODER_BUFFER_LENGTHS.0]> = StaticCell::new();
 static DECODER_COMPLEX_MEMORY: StaticCell<[Complex; DECODER_BUFFER_LENGTHS.1]> = StaticCell::new();
 
@@ -61,6 +70,27 @@ pub fn progress() -> AudioProgress {
 
 fn mark_progress(progress: AudioProgress) {
     AUDIO_PROGRESS.fetch_max(progress as u8, Ordering::Relaxed);
+}
+
+/// Publishes a volume received from the LE Audio source for the USB task to apply.
+fn publish_volume(command: VolumeCommand) {
+    let packed = u16::from(command.level) | if command.muted { VOLUME_MUTED_BIT } else { 0 };
+    VOLUME.store(packed, Ordering::Relaxed);
+}
+
+/// Takes the pending volume, if the source has sent one since the last call.
+///
+/// Consuming the value means the USB task only issues a control transfer when something actually
+/// changed, rather than on every packet.
+pub fn take_volume() -> Option<VolumeCommand> {
+    let packed = VOLUME.swap(NO_VOLUME, Ordering::Relaxed);
+    if packed == NO_VOLUME {
+        return None;
+    }
+    Some(VolumeCommand {
+        level: packed as u8,
+        muted: packed & VOLUME_MUTED_BIT != 0,
+    })
 }
 
 /// One 10 ms block of signed stereo PCM stored as decoder-native channel planes.
@@ -191,6 +221,17 @@ pub async fn run(mut uart: BufferedUartRx, mut pcm: PcmSender) -> ! {
                 }
             };
             mark_progress(AudioProgress::WireFrame);
+
+            if frame.meta.encoding == AudioEncoding::Volume {
+                match VolumeCommand::from_payload(frame.payload()) {
+                    Some(command) => {
+                        defmt::info!("volume received: level={} muted={}", command.level, command.muted);
+                        publish_volume(command);
+                    }
+                    None => defmt::warn!("malformed volume frame: {} bytes", frame.payload().len()),
+                }
+                continue;
+            }
 
             if frame.meta.encoding != AudioEncoding::Lc3
                 || frame.meta.sample_rate_hz != SAMPLE_RATE_HZ

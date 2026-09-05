@@ -1825,7 +1825,7 @@ dependencies = [
 [[package]]
 name = "trouble-audio-example-apps"
 version = "0.1.0"
-source = "git+https://github.com/LegitCamper/trouble_audio?rev=973a469b8db94e0a74db1ab7bb887b13e5e4d80f#973a469b8db94e0a74db1ab7bb887b13e5e4d80f"
+source = "git+https://github.com/LegitCamper/trouble_audio?rev=2abf9f1512cd02a478aa719c85d82816ac0ec599#2abf9f1512cd02a478aa719c85d82816ac0ec599"
 dependencies = [
  "bt-hci",
  "defmt 1.1.1",
@@ -1883,7 +1883,7 @@ dependencies = [
 [[package]]
 name = "trouble_audio"
 version = "0.1.0"
-source = "git+https://github.com/LegitCamper/trouble_audio?rev=973a469b8db94e0a74db1ab7bb887b13e5e4d80f#973a469b8db94e0a74db1ab7bb887b13e5e4d80f"
+source = "git+https://github.com/LegitCamper/trouble_audio?rev=2abf9f1512cd02a478aa719c85d82816ac0ec599#2abf9f1512cd02a478aa719c85d82816ac0ec599"
 dependencies = [
  "aes",
  "bitflags 2.13.1",

@@ -2,8 +2,12 @@
 resolver = "2"
 members = [
     "crates/audio-link",
+    "crates/uac-descriptor",
 ]
-default-members = ["crates/audio-link"]
+default-members = [
+    "crates/audio-link",
+    "crates/uac-descriptor",
+]
 exclude = [
     "firmware/nrf54l15",
     "firmware/xiao-rp2350",

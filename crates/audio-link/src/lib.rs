@@ -19,6 +19,8 @@ pub const PCM_S12_MONO_FRAME_BYTES: usize = 720;
 pub const PCM_MONO_SAMPLES_PER_FRAME: usize = 480;
 /// Largest audio payload accepted by the transport.
 pub const MAX_AUDIO_PAYLOAD_BYTES: usize = PCM_S12_MONO_FRAME_BYTES;
+/// Bytes in a [`VolumeCommand`] payload.
+pub const VOLUME_FRAME_BYTES: usize = 2;
 
 const HEADER_BYTES: usize = 18;
 const CRC_BYTES: usize = 2;
@@ -27,7 +29,7 @@ const MAX_COBS_FRAME_BYTES: usize = MAX_RAW_FRAME_BYTES + MAX_RAW_FRAME_BYTES / 
 /// Largest encoded frame, including its trailing zero delimiter.
 pub const MAX_WIRE_FRAME_BYTES: usize = MAX_COBS_FRAME_BYTES + 1;
 
-/// Encoding used by an audio-frame payload.
+/// Kind of payload carried by one frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum AudioEncoding {
@@ -35,6 +37,9 @@ pub enum AudioEncoding {
     Lc3 = 1,
     /// Two signed 12-bit little-endian PCM samples packed into each three bytes.
     PcmS12LeMono = 2,
+    /// A [`VolumeCommand`] rather than audio. Receivers that predate this kind reject it as an
+    /// unsupported kind and drop the frame, so adding it did not need a protocol version bump.
+    Volume = 3,
 }
 
 impl TryFrom<u8> for AudioEncoding {
@@ -44,6 +49,7 @@ impl TryFrom<u8> for AudioEncoding {
         match value {
             1 => Ok(Self::Lc3),
             2 => Ok(Self::PcmS12LeMono),
+            3 => Ok(Self::Volume),
             _ => Err(DecodeError::UnsupportedKind(value)),
         }
     }
@@ -175,6 +181,46 @@ impl DecodedFrame {
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         &self.payload[..self.payload_len]
+    }
+}
+
+/// A rendering volume carried from the LE Audio sink to the USB bridge.
+///
+/// `level` is the LE Audio Volume Control Service scale, 0..=255. `muted` is carried separately
+/// from `level` because the profile keeps the two independent: unmuting has to restore the
+/// previous level rather than a level of zero.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VolumeCommand {
+    /// Volume setting on the 0..=255 Volume Control Service scale.
+    pub level: u8,
+    /// Whether rendering is muted.
+    pub muted: bool,
+}
+
+impl VolumeCommand {
+    /// Bit 0 of the flags byte marks the muted state.
+    const MUTED: u8 = 0b0000_0001;
+
+    /// Serializes the command into its wire payload.
+    #[must_use]
+    pub const fn to_payload(self) -> [u8; VOLUME_FRAME_BYTES] {
+        [self.level, if self.muted { Self::MUTED } else { 0 }]
+    }
+
+    /// Parses a volume payload, returning `None` if it is not exactly
+    /// [`VOLUME_FRAME_BYTES`] long.
+    ///
+    /// Unknown flag bits are ignored so a future sender can add them without breaking receivers.
+    #[must_use]
+    pub fn from_payload(payload: &[u8]) -> Option<Self> {
+        let [level, flags] = *payload.first_chunk::<VOLUME_FRAME_BYTES>()?;
+        if payload.len() != VOLUME_FRAME_BYTES {
+            return None;
+        }
+        Some(Self {
+            level,
+            muted: flags & Self::MUTED != 0,
+        })
     }
 }
 
@@ -322,6 +368,7 @@ pub fn encode(meta: FrameMeta, payload: &[u8]) -> Result<EncodedFrame, EncodeErr
     let payload_limit = match meta.encoding {
         AudioEncoding::Lc3 => MAX_LC3_FRAME_BYTES,
         AudioEncoding::PcmS12LeMono => PCM_S12_MONO_FRAME_BYTES,
+        AudioEncoding::Volume => VOLUME_FRAME_BYTES,
     };
     if payload.len() > payload_limit {
         return Err(EncodeError::PayloadTooLong(payload.len()));
@@ -432,6 +479,7 @@ fn decode_raw(raw: &[u8]) -> Result<DecodedFrame, DecodeError> {
     let payload_limit = match encoding {
         AudioEncoding::Lc3 => MAX_LC3_FRAME_BYTES,
         AudioEncoding::PcmS12LeMono => PCM_S12_MONO_FRAME_BYTES,
+        AudioEncoding::Volume => VOLUME_FRAME_BYTES,
     };
     if payload_len > payload_limit || raw.len() != HEADER_BYTES + payload_len + CRC_BYTES {
         return Err(DecodeError::LengthMismatch);
@@ -603,6 +651,72 @@ mod tests {
             completed_frame = parser.push(byte).expect("next frame must decode").or(completed_frame);
         }
         assert_eq!(completed_frame.expect("frame expected").payload(), &[9, 8, 7]);
+    }
+
+    #[test]
+    fn volume_command_should_round_trip_through_a_wire_frame() {
+        let command = VolumeCommand {
+            level: 200,
+            muted: false,
+        };
+        let meta = FrameMeta {
+            encoding: AudioEncoding::Volume,
+            ..example_meta()
+        };
+
+        let encoded = encode(meta, &command.to_payload()).expect("volume payload fits");
+        let mut parser = StreamDecoder::new();
+        let mut decoded = None;
+        for byte in encoded.as_bytes() {
+            if let Ok(Some(frame)) = parser.push(*byte) {
+                decoded = Some(frame);
+            }
+        }
+
+        let decoded = decoded.expect("one complete frame");
+        assert_eq!(decoded.meta.encoding, AudioEncoding::Volume);
+        assert_eq!(VolumeCommand::from_payload(decoded.payload()), Some(command));
+    }
+
+    #[test]
+    fn volume_command_should_carry_mute_independently_of_level() {
+        let command = VolumeCommand {
+            level: 200,
+            muted: true,
+        };
+
+        assert_eq!(VolumeCommand::from_payload(&command.to_payload()), Some(command));
+    }
+
+    #[test]
+    fn volume_command_should_ignore_unknown_flag_bits() {
+        assert_eq!(
+            VolumeCommand::from_payload(&[42, 0b1111_1110]),
+            Some(VolumeCommand {
+                level: 42,
+                muted: false
+            })
+        );
+    }
+
+    #[test]
+    fn volume_command_should_reject_a_wrong_length_payload() {
+        assert_eq!(VolumeCommand::from_payload(&[]), None);
+        assert_eq!(VolumeCommand::from_payload(&[1]), None);
+        assert_eq!(VolumeCommand::from_payload(&[1, 0, 0]), None);
+    }
+
+    #[test]
+    fn encode_should_reject_an_oversized_volume_payload() {
+        let meta = FrameMeta {
+            encoding: AudioEncoding::Volume,
+            ..example_meta()
+        };
+
+        assert_eq!(
+            encode(meta, &[0; VOLUME_FRAME_BYTES + 1]).err(),
+            Some(EncodeError::PayloadTooLong(VOLUME_FRAME_BYTES + 1))
+        );
     }
 
     #[test]

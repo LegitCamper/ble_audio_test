@@ -130,10 +130,15 @@ name = "ble-audio-link"
 version = "0.1.0"
 
 [[package]]
+name = "ble-audio-uac-descriptor"
+version = "0.1.0"
+
+[[package]]
 name = "ble-audio-xiao-rp2350"
 version = "0.1.0"
 dependencies = [
  "ble-audio-link",
+ "ble-audio-uac-descriptor",
  "cortex-m",
  "cortex-m-rt",
  "defmt",

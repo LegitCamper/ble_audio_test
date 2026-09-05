@@ -5,7 +5,7 @@
 
 mod audio;
 mod iso;
-mod uac2;
+mod usb_audio;
 
 use defmt::unwrap;
 use embassy_executor::Executor;
@@ -26,11 +26,11 @@ use crate::audio::AudioProgress;
 #[cfg(not(feature = "usb-test-tone"))]
 use crate::audio::SAMPLES_PER_CHANNEL;
 use crate::audio::{PcmReceiver, PcmSender};
-use crate::uac2::{MINIMUM_PACKET_FRAMES, NOMINAL_PACKET_FRAMES, Uac2Playback};
+use crate::usb_audio::{MINIMUM_PACKET_FRAMES, NOMINAL_PACKET_FRAMES, UsbAudioPlayback, VolumeOwner};
 
 const CORE1_STACK_SIZE: usize = 64 * 1024;
 const SYSTEM_CLOCK_HZ: u32 = 300_000_000;
-const _: () = assert!(uac2::SAMPLE_RATE_HZ == audio::SAMPLE_RATE_HZ);
+const _: () = assert!(usb_audio::SAMPLE_RATE_HZ == audio::SAMPLE_RATE_HZ);
 #[cfg(not(feature = "usb-test-tone"))]
 const PCM_PREBUFFER_BLOCKS: usize = 6;
 
@@ -256,10 +256,10 @@ async fn usb_task(
                 continue;
             }
         };
-        let mut playback = match Uac2Playback::configure(&host, &enumeration).await {
+        let mut playback = match UsbAudioPlayback::configure(&host, &enumeration).await {
             Ok(playback) => playback,
             Err(error) => {
-                defmt::warn!("TE-C UAC2 setup failed: {:?}", error);
+                defmt::warn!("USB Audio setup failed: {:?}", error);
                 let _ = host.wait_for_device_event().await;
                 continue;
             }
@@ -270,15 +270,19 @@ async fn usb_task(
         let mut usb_frames = 0_u32;
         let feedback_interval = playback.feedback_interval_frames();
         let mut feedback_failures = 0_u8;
-        let mut feedback_enabled = true;
+        let mut feedback_enabled = feedback_interval != 0;
         let mut logged_feedback = false;
         let mut displayed_pcm_blocks = 0_u32;
         let mut cadence_started = Instant::now();
         let mut cadence_pcm_frames = 0_u32;
         defmt::info!(
-            "TE-C UAC2 playback started: rate={} feedback_interval_frames={}",
-            uac2::SAMPLE_RATE_HZ,
-            feedback_interval
+            "USB Audio playback started: rate={} feedback_interval_frames={} volume_owner={}",
+            usb_audio::SAMPLE_RATE_HZ,
+            feedback_interval,
+            match playback.volume_owner() {
+                VolumeOwner::Dac => "dac",
+                VolumeOwner::Host => "rp2350",
+            }
         );
 
         loop {
@@ -310,6 +314,15 @@ async fn usb_task(
                 led.show(state);
             }
             usb_frames = usb_frames.wrapping_add(1);
+
+            // Applied straight after the audio write so a control transfer to a DAC-owned volume
+            // never delays the isochronous packet. Volume changes are user-paced, so this costs
+            // nothing on the overwhelming majority of frames.
+            if let Some(command) = audio::take_volume()
+                && let Err(error) = playback.set_volume(command.level, command.muted).await
+            {
+                defmt::warn!("volume update failed: {:?}", error);
+            }
 
             // Keep the time-critical audio OUT transaction first. A cheap Full-Speed DAC may
             // intermittently omit feedback; repeated failures fall back to the nominal packet
