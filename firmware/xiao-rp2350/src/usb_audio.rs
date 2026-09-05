@@ -7,7 +7,8 @@ use embassy_usb_driver::{EndpointInfo, EndpointType};
 
 use crate::iso::IsoEndpoint;
 use ble_audio_uac_descriptor::{
-    AudioClassVersion, AudioEndpoint, BYTES_PER_FRAME, FeatureUnitVolume, PlaybackConfig, find_playback,
+    AudioClassVersion, AudioEndpoint, BYTES_PER_FRAME, FeatureUnitVolume, PlaybackConfig, UNITY_GAIN_Q15,
+    VOLUME_SILENCE, device_volume_setting, find_playback, host_gain_q15,
 };
 
 const CS_SAM_FREQ_CONTROL: u8 = 0x01;
@@ -21,12 +22,6 @@ const UAC1_REQUEST_GET_MIN: u8 = 0x82;
 const UAC1_REQUEST_GET_MAX: u8 = 0x83;
 /// Channel 0 addresses a feature unit's master control.
 const VOLUME_CHANNEL_MASTER: u8 = 0;
-/// Full-scale gain in Q15, applied when the host owns volume and nothing is attenuating.
-const UNITY_GAIN_Q15: u16 = 1 << 15;
-/// UAC reserves this volume code for silence rather than treating it as a real level.
-const VOLUME_SILENCE: i16 = i16::MIN;
-/// Highest level on the LE Audio volume scale.
-const MAXIMUM_LEVEL: u16 = 255;
 const DESCRIPTOR_BUFFER_SIZE: usize = 1_024;
 
 /// Playback rate requested from the DAC, matching the decoded LC3 stream.
@@ -286,8 +281,18 @@ impl<H: UsbHostDriver> UsbAudioPlayback<H> {
     }
 
     /// Waits for the next USB Start-of-Frame boundary.
-    pub async fn wait_for_sof(&self) {
-        self.output.wait_for_next_sof().await;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError`] if the device leaves the bus before the next frame.
+    pub async fn wait_for_sof(&self) -> Result<(), HostError> {
+        self.output.wait_for_next_sof().await
+    }
+
+    /// Reports whether a Full-Speed or Low-Speed device is still present on the root port.
+    #[must_use]
+    pub fn is_device_connected(&self) -> bool {
+        self.output.is_device_connected()
     }
 }
 
@@ -302,53 +307,6 @@ fn attenuate(packet: &mut [u8], gain_q15: u16) {
         let scaled = (value * i32::from(gain_q15)) >> 15;
         sample.copy_from_slice(&(scaled as i16).to_le_bytes());
     }
-}
-
-/// Q15 gains matching [`VOLUME_RANGE_DB`] at evenly spaced levels from 0 to 255.
-///
-/// A table keeps the host path on the same decibel curve as the device path without needing a
-/// power function; sixteen segments hold the interpolation error well under the ~0.4 dB a
-/// listener can notice.
-const HOST_GAIN_Q15: [u16; 17] = [
-    33, 50, 78, 120, 184, 284, 437, 673, 1036, 1596, 2457, 3784, 5827, 8973, 13818, 21279, 32768,
-];
-
-/// Attenuation the bottom of the volume scale corresponds to.
-///
-/// Volume settings are already logarithmic, so a level maps linearly onto this range. Applying a
-/// further taper, or spanning the device's whole reported range, puts most of the scale below
-/// audibility: DACs commonly report a floor near -127 dB.
-const VOLUME_RANGE_DB: i32 = 60;
-
-/// Maps an LE Audio level onto a Q15 gain along the same decibel curve the device path uses.
-fn host_gain_q15(level: u8) -> u16 {
-    let segments = (HOST_GAIN_Q15.len() - 1) as u32;
-    let scaled = u32::from(level) * segments;
-    let segment = (scaled / u32::from(MAXIMUM_LEVEL)) as usize;
-    let Some(&lower) = HOST_GAIN_Q15.get(segment) else {
-        return UNITY_GAIN_Q15;
-    };
-    let Some(&upper) = HOST_GAIN_Q15.get(segment + 1) else {
-        return lower;
-    };
-    // Interpolate linearly between the two nearest table entries.
-    let position = scaled % u32::from(MAXIMUM_LEVEL);
-    let step = u32::from(upper - lower) * position / u32::from(MAXIMUM_LEVEL);
-    (u32::from(lower) + step) as u16
-}
-
-/// Maps an LE Audio level onto a device volume in 1/256 dB, clamped to the range the device
-/// reported.
-fn device_volume_setting(level: u8, minimum_db_256: i16, maximum_db_256: i16) -> i16 {
-    if level == 0 {
-        return VOLUME_SILENCE;
-    }
-    let maximum = i32::from(maximum_db_256);
-    let minimum = i32::from(minimum_db_256);
-    // Never reach below the device's own floor, but do not follow it all the way down either.
-    let floor = (maximum - VOLUME_RANGE_DB * 256).max(minimum);
-    let setting = floor + (maximum - floor) * i32::from(level) / i32::from(MAXIMUM_LEVEL);
-    setting.clamp(minimum, maximum) as i16
 }
 
 const fn volume_control_value(channel: u8) -> u16 {

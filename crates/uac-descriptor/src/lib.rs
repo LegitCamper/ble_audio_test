@@ -81,9 +81,10 @@ const HOST_GAIN_Q15: [u16; 17] = [
 /// uses, so moving volume between the host and the device does not change the feel of the control.
 #[must_use]
 pub fn host_gain_q15(level: u8) -> u16 {
-    let segments = (HOST_GAIN_Q15.len() - 1) as u32;
-    let scaled = u32::from(level) * segments;
-    let segment = (scaled / u32::from(MAXIMUM_LEVEL)) as usize;
+    const SEGMENTS: u32 = 16;
+
+    let scaled = u32::from(level) * SEGMENTS;
+    let segment = usize::try_from(scaled / u32::from(MAXIMUM_LEVEL)).unwrap_or(HOST_GAIN_Q15.len() - 1);
     let Some(&lower) = HOST_GAIN_Q15.get(segment) else {
         return UNITY_GAIN_Q15;
     };
@@ -93,7 +94,7 @@ pub fn host_gain_q15(level: u8) -> u16 {
     // Interpolate linearly between the two nearest table entries.
     let position = scaled % u32::from(MAXIMUM_LEVEL);
     let step = u32::from(upper - lower) * position / u32::from(MAXIMUM_LEVEL);
-    (u32::from(lower) + step) as u16
+    u16::try_from(u32::from(lower) + step).unwrap_or(UNITY_GAIN_Q15)
 }
 
 /// Maps an LE Audio level onto a device volume in 1/256 dB, clamped to the range the device
@@ -112,7 +113,7 @@ pub fn device_volume_setting(level: u8, minimum_db_256: i16, maximum_db_256: i16
     // Never reach below the device's own floor, but do not follow it all the way down either.
     let floor = (maximum - VOLUME_RANGE_DB * 256).max(minimum);
     let setting = floor + (maximum - floor) * i32::from(level) / i32::from(MAXIMUM_LEVEL);
-    setting.clamp(minimum, maximum) as i16
+    i16::try_from(setting.clamp(minimum, maximum)).unwrap_or(maximum_db_256)
 }
 
 /// USB Audio specification generation used by a playback alternate setting.
@@ -1026,7 +1027,7 @@ mod tests {
     fn host_gain_tracks_the_decibel_curve_between_table_entries() {
         // Interpolation error has to stay well under what a listener notices.
         for level in 1..=MAXIMUM_LEVEL {
-            let expected = -f64::from(VOLUME_RANGE_DB as i32) * (1.0 - f64::from(level) / 255.0);
+            let expected = -f64::from(VOLUME_RANGE_DB) * (1.0 - f64::from(level) / 255.0);
             let error = (gain_db(host_gain_q15(level)) - expected).abs();
             assert!(error < 0.4, "level {level} was off by {error} dB");
         }
@@ -1040,7 +1041,7 @@ mod tests {
         let maximum = 0;
 
         assert_eq!(device_volume_setting(MAXIMUM_LEVEL, minimum, maximum), 0);
-        assert_eq!(device_volume_setting(128, minimum, maximum), -30 * 256 + 15);
+        assert_eq!(device_volume_setting(128, minimum, maximum), -30 * 256 + 30);
         assert_eq!(device_volume_setting(204, minimum, maximum), -12 * 256);
     }
 
@@ -1050,7 +1051,7 @@ mod tests {
             for level in 1..=MAXIMUM_LEVEL {
                 let setting = device_volume_setting(level, minimum, maximum);
                 assert!(
-                    (minimum..=maximum).contains(&i32::from(setting)),
+                    (minimum..=maximum).contains(&setting),
                     "level {level} produced {setting} outside {minimum}..={maximum}"
                 );
             }
@@ -1062,11 +1063,8 @@ mod tests {
         // A device that only attenuates by 20 dB must still reach both of its own limits.
         let (minimum, maximum) = (-20 * 256, 0);
 
-        assert_eq!(device_volume_setting(MAXIMUM_LEVEL, minimum, maximum), maximum as i16);
-        assert_eq!(
-            device_volume_setting(1, minimum, maximum),
-            (minimum + 20 * 256 / 255) as i16
-        );
+        assert_eq!(device_volume_setting(MAXIMUM_LEVEL, minimum, maximum), maximum);
+        assert_eq!(device_volume_setting(1, minimum, maximum), minimum + 20 * 256 / 255);
     }
 
     #[test]

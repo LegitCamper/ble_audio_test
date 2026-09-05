@@ -84,6 +84,11 @@ forwarded to the RP2350 as a kind-3 serial frame, so the value that crosses the 
 profile state machine settled on, including its clamping of relative steps. Mute travels separately
 from the level, because unmuting has to restore the previous level rather than zero.
 
+The nRF persists the latest bond in RRAM. On boot and after a disconnect it first sends directed
+advertisements to that saved peer for five seconds, then falls back to normal discoverable
+advertising so a different source can still connect. The peripheral cannot initiate a BLE link,
+but directed advertising gives the saved phone a fast, targeted reconnect opportunity.
+
 On the USB side, volume has exactly one owner, chosen once at configure time. If the
 device exposes a feature unit fed by this stream that claims a writable volume control, the host
 probes its range and, when that succeeds, hands volume to the DAC. A device that advertises no such
@@ -91,7 +96,8 @@ control, or advertises one whose probe stalls, leaves the RP2350 applying a Q15 
 on the way into USB DPRAM instead. Because the choice is made before streaming starts and never
 changes, attenuation is never applied twice. The Embassy host fork
 rejects isochronous channel allocation at runtime, so `iso.rs` supplies a direct RP2 EPX transaction
-path paced from USB SOF.
+path paced from USB SOF. A transient isochronous transaction failure drops only that packet and the
+next SOF retries in place; a real detach exits playback and waits for the DAC to reconnect.
 
 ## Wiring
 

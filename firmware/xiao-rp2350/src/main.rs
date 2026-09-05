@@ -275,6 +275,7 @@ async fn usb_task(
         let mut displayed_pcm_blocks = 0_u32;
         let mut cadence_started = Instant::now();
         let mut cadence_pcm_frames = 0_u32;
+        let mut transaction_failures = 0_u32;
         defmt::info!(
             "USB Audio playback started: rate={} feedback_interval_frames={} volume_owner={}",
             usb_audio::SAMPLE_RATE_HZ,
@@ -286,14 +287,29 @@ async fn usb_task(
         );
 
         loop {
-            playback.wait_for_sof().await;
+            if let Err(error) = playback.wait_for_sof().await {
+                defmt::info!("USB Audio device left the bus: {:?}", error);
+                led.show(BridgeState::WaitingForDac);
+                break;
+            }
             let stereo_frames = rate.next_packet_frames();
             let packet_len = stereo_frames * 4;
             if let Err(error) = playback.write_packet_with(packet_len, |packet| pcm.fill_packet(stereo_frames, packet))
             {
-                defmt::warn!("isochronous audio write failed: {:?}", error);
-                led.show(BridgeState::WaitingForDac);
-                break;
+                transaction_failures = transaction_failures.wrapping_add(1);
+                if !playback.is_device_connected() {
+                    defmt::info!("USB Audio device disconnected during write: {:?}", error);
+                    led.show(BridgeState::WaitingForDac);
+                    break;
+                }
+                if transaction_failures == 1 || transaction_failures % 100 == 0 {
+                    defmt::warn!(
+                        "transient isochronous write failure; continuing: error={:?} count={}",
+                        error,
+                        transaction_failures
+                    );
+                }
+                continue;
             }
             cadence_pcm_frames = cadence_pcm_frames.wrapping_add(stereo_frames as u32);
             if pcm.is_buffering() {

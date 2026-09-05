@@ -53,11 +53,25 @@ impl IsoEndpoint {
     }
 
     /// Waits until the host controller advances to a new one-millisecond USB frame.
-    pub async fn wait_for_next_sof(&self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError`] if the device leaves the bus before the next frame.
+    pub async fn wait_for_next_sof(&self) -> Result<(), HostError> {
         let frame = pac::USB.sof_rd().read().count();
         while pac::USB.sof_rd().read().count() == frame {
+            if !self.is_device_connected() {
+                return Err(ChannelError::Disconnected.into());
+            }
             Timer::after_micros(20).await;
         }
+        Ok(())
+    }
+
+    /// Reports whether a Full-Speed or Low-Speed device is present on the root port.
+    #[must_use]
+    pub fn is_device_connected(&self) -> bool {
+        matches!(pac::USB.sie_status().read().speed(), 0b01 | 0b10)
     }
 
     /// Fills USB DPRAM in place and sends one DATA0 isochronous OUT transaction.

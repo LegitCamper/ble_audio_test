@@ -16,6 +16,7 @@ use bt_hci::controller::{ControllerCmdAsync, ControllerCmdSync};
 use defmt::Debug2Format;
 use embassy_futures::select::{Either4, select4};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_time::Duration;
 use heapless::Vec as HVec;
 use trouble_audio::cis::{self, CisManager};
 use trouble_audio::prelude::*;
@@ -38,6 +39,8 @@ const INITIAL_VOLUME: u8 = 128;
 /// Amount one relative Volume Control Point step moves the setting, giving 16 steps across the
 /// scale, which is close to what phone volume rockers expect.
 const VOLUME_STEP: u8 = 16;
+/// Time spent targeting a saved peer before returning to discoverable advertising.
+const DIRECTED_RECONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Attribute backing store for every service this sink exposes.
 ///
@@ -98,9 +101,12 @@ where
         // No display or keyboard on an audio sink: JustWorks pairing.
         .set_io_capabilities(IoCapabilities::NoInputNoOutput)
         .build();
-    if let Some(bond) = bond_store.load() {
+    let mut bonded_peer = bond_store.load().map(|bond| {
+        let peer = bond.identity.addr;
         let _ = stack.add_bond_information(bond);
-    }
+        defmt::info!("loaded saved peer for directed reconnect: {}", peer);
+        peer
+    });
     let mut runner = stack.runner();
     let mut peripheral = stack.peripheral();
 
@@ -166,7 +172,7 @@ where
         },
         async {
             loop {
-                let conn = match advertise(advertiser_data, &mut peripheral, &server).await {
+                let conn = match advertise(advertiser_data, bonded_peer, &mut peripheral, &server).await {
                     Ok(conn) => conn,
                     Err(error) => {
                         defmt::warn!("advertise error: {}", Debug2Format(&error));
@@ -232,6 +238,7 @@ where
                             // recognized on its next reconnect.
                             let _ = stack.add_bond_information(bond.clone());
                             bond_store.save(&bond);
+                            bonded_peer = Some(bond.identity.addr);
                         }
                         GattConnectionEvent::PairingComplete {
                             security_level,
@@ -283,9 +290,26 @@ fn publish_volume(server: &Server<'_, MAX_ASES, CONNECTIONS_MAX, NoopRawMutex>, 
 
 async fn advertise<'values, 'server, C: Controller>(
     adv_data: &[u8],
+    bonded_peer: Option<Address>,
     peripheral: &mut Peripheral<'values, C, DefaultPacketPool>,
     server: &'server Server<'values, MAX_ASES, CONNECTIONS_MAX, NoopRawMutex>,
 ) -> Result<GattConnection<'values, 'server, DefaultPacketPool>, BleHostError<C::Error>> {
+    if let Some(peer) = bonded_peer {
+        let params = AdvertisementParameters {
+            timeout: Some(DIRECTED_RECONNECT_TIMEOUT),
+            ..Default::default()
+        };
+        let advertiser = peripheral
+            .advertise(&params, Advertisement::ConnectableNonscannableDirected { peer })
+            .await?;
+        defmt::info!("directed advertising to saved peer: {}", peer);
+        match advertiser.accept().await {
+            Ok(conn) => return Ok(conn.with_attribute_server(&server.server)?),
+            Err(Error::Timeout) => defmt::info!("saved peer did not reconnect; advertising to all peers"),
+            Err(error) => defmt::warn!("directed advertising failed: {}", Debug2Format(&error)),
+        }
+    }
+
     let advertiser = peripheral
         .advertise(
             &Default::default(),
