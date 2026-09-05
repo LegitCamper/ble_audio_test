@@ -61,12 +61,12 @@ pub const MAXIMUM_LEVEL: u8 = 255;
 pub const UNITY_GAIN_Q15: u16 = 1 << 15;
 /// USB Audio reserves this volume code for silence rather than treating it as a real level.
 pub const VOLUME_SILENCE: i16 = i16::MIN;
-/// Attenuation the bottom of the volume scale corresponds to.
+/// Attenuation the bottom of the nonzero volume scale corresponds to.
 ///
-/// Volume settings are already logarithmic, so a level maps linearly onto this range. Applying a
-/// further taper, or spanning the device's whole reported range, puts most of the scale below
-/// audibility: DACs commonly report a floor near -127 dB.
-pub const VOLUME_RANGE_DB: i32 = 60;
+/// A 30 dB range keeps the lower half useful on quiet source material: half scale is about
+/// -15 dB. Spanning a DAC's whole reported range puts most of the control below audibility, since
+/// DACs commonly report a floor near -127 dB. Level zero remains exact silence.
+pub const VOLUME_RANGE_DB: i32 = 30;
 
 /// Q15 gains matching [`VOLUME_RANGE_DB`] at evenly spaced levels from 0 to [`MAXIMUM_LEVEL`].
 ///
@@ -74,7 +74,7 @@ pub const VOLUME_RANGE_DB: i32 = 60;
 /// power function; sixteen segments hold the interpolation error well under the ~0.4 dB a
 /// listener can notice.
 const HOST_GAIN_Q15: [u16; 17] = [
-    33, 50, 78, 120, 184, 284, 437, 673, 1036, 1596, 2457, 3784, 5827, 8973, 13818, 21279, 32768,
+    1036, 1286, 1596, 1980, 2457, 3049, 3784, 4696, 5827, 7231, 8973, 11135, 13818, 17147, 21279, 26406, 32768,
 ];
 
 /// Maps an LE Audio level onto a Q15 gain along the same decibel curve [`device_volume_setting`]
@@ -83,6 +83,9 @@ const HOST_GAIN_Q15: [u16; 17] = [
 pub fn host_gain_q15(level: u8) -> u16 {
     const SEGMENTS: u32 = 16;
 
+    if level == 0 {
+        return 0;
+    }
     let scaled = u32::from(level) * SEGMENTS;
     let segment = usize::try_from(scaled / u32::from(MAXIMUM_LEVEL)).unwrap_or(HOST_GAIN_Q15.len() - 1);
     let Some(&lower) = HOST_GAIN_Q15.get(segment) else {
@@ -1003,13 +1006,12 @@ mod tests {
     }
 
     #[test]
-    fn host_gain_spans_the_usable_range_without_a_silent_lower_half() {
+    fn host_gain_keeps_the_lower_half_audible() {
         assert_eq!(host_gain_q15(MAXIMUM_LEVEL), UNITY_GAIN_Q15);
-        // The midpoint must land near half the range in decibels, not near silence. The squared
-        // taper this replaced put 50% at about -95 dB, which was inaudible.
-        assert!((gain_db(host_gain_q15(128)) + 30.0).abs() < 1.0);
-        assert!((gain_db(host_gain_q15(204)) + 12.0).abs() < 1.0);
-        assert!((gain_db(host_gain_q15(0)) + 60.0).abs() < 1.0);
+        // The midpoint must remain comfortably audible on quiet source material.
+        assert!((gain_db(host_gain_q15(128)) + 15.0).abs() < 1.0);
+        assert!((gain_db(host_gain_q15(204)) + 6.0).abs() < 1.0);
+        assert!((gain_db(host_gain_q15(1)) + 30.0).abs() < 1.0);
     }
 
     #[test]
@@ -1041,8 +1043,8 @@ mod tests {
         let maximum = 0;
 
         assert_eq!(device_volume_setting(MAXIMUM_LEVEL, minimum, maximum), 0);
-        assert_eq!(device_volume_setting(128, minimum, maximum), -30 * 256 + 30);
-        assert_eq!(device_volume_setting(204, minimum, maximum), -12 * 256);
+        assert_eq!(device_volume_setting(128, minimum, maximum), -15 * 256 + 15);
+        assert_eq!(device_volume_setting(204, minimum, maximum), -6 * 256);
     }
 
     #[test]
@@ -1070,8 +1072,7 @@ mod tests {
     #[test]
     fn level_zero_is_silence_on_both_paths() {
         assert_eq!(device_volume_setting(0, -127 * 256, 0), VOLUME_SILENCE);
-        // The host path expresses silence as a zero gain instead, which the caller applies.
-        assert!(gain_db(host_gain_q15(0)) < -50.0);
+        assert_eq!(host_gain_q15(0), 0);
     }
 
     #[test]

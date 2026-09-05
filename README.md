@@ -95,8 +95,10 @@ On the USB side, volume has exactly one owner, chosen once at configure time. If
 device exposes a feature unit fed by this stream that claims a writable volume control, the host
 probes its range and, when that succeeds, hands volume to the DAC. A device that advertises no such
 control, or advertises one whose probe stalls, leaves the RP2350 applying a Q15 gain to each sample
-on the way into USB DPRAM instead. Because the choice is made before streaming starts and never
-changes, attenuation is never applied twice. The Embassy host fork
+on the way into USB DPRAM instead. Both paths map nonzero VCS levels onto the same -30 dB to 0 dB
+range, keeping the lower half of the phone slider audible; level zero and VCS mute are exact
+silence. Because the choice is made before streaming starts and never changes, attenuation is
+never applied twice. The Embassy host fork
 rejects isochronous channel allocation at runtime, so `iso.rs` supplies a direct RP2 EPX transaction
 path paced from USB SOF. A transient isochronous transaction failure drops only that packet and the
 next SOF retries in place; a real detach exits playback and waits for the DAC to reconnect.
