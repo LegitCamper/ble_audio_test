@@ -1825,6 +1825,7 @@ dependencies = [
 [[package]]
 name = "trouble-audio-example-apps"
 version = "0.1.0"
+source = "git+https://github.com/LegitCamper/trouble_audio?rev=973a469b8db94e0a74db1ab7bb887b13e5e4d80f#973a469b8db94e0a74db1ab7bb887b13e5e4d80f"
 dependencies = [
  "bt-hci",
  "defmt 1.1.1",
@@ -1844,6 +1845,7 @@ dependencies = [
 [[package]]
 name = "trouble-host"
 version = "0.8.0"
+source = "git+https://github.com/LegitCamper/trouble?branch=fix%2Fiso-disconnection-events#984c098a6f392b76c355af54fce585b6fb6fae88"
 dependencies = [
  "aes",
  "bt-hci",
@@ -1868,6 +1870,7 @@ dependencies = [
 [[package]]
 name = "trouble-host-macros"
 version = "0.6.0"
+source = "git+https://github.com/LegitCamper/trouble?branch=fix%2Fiso-disconnection-events#984c098a6f392b76c355af54fce585b6fb6fae88"
 dependencies = [
  "convert_case",
  "darling",
@@ -1880,6 +1883,7 @@ dependencies = [
 [[package]]
 name = "trouble_audio"
 version = "0.1.0"
+source = "git+https://github.com/LegitCamper/trouble_audio?rev=973a469b8db94e0a74db1ab7bb887b13e5e4d80f#973a469b8db94e0a74db1ab7bb887b13e5e4d80f"
 dependencies = [
  "aes",
  "bitflags 2.13.1",

@@ -28,9 +28,9 @@ nrf-mpsl = { git = "https://github.com/LegitCamper/nrf-sdc", rev = "478e1f5c5ba2
 nrf-sdc = { git = "https://github.com/LegitCamper/nrf-sdc", rev = "478e1f5c5ba2e6c749c06f3a2bf290784194b415", default-features = false, features = ["defmt", "peripheral", "central", "nrf54l15-app-s"] }
 panic-probe = { version = "1", features = ["print-defmt"] }
 static_cell = "2"
-trouble-audio = { path = "../../../trouble_audio/trouble-audio", package = "trouble_audio", default-features = false, features = ["defmt", "nrf-sdc"] }
-trouble-audio-example-apps = { path = "../../../trouble_audio/examples/apps", features = ["defmt"] }
-trouble-host = { path = "../../../trouble/host", features = ["derive", "scan", "gatt", "central", "security", "iso", "default-packet-pool"] }
+trouble-audio = { git = "https://github.com/LegitCamper/trouble_audio", rev = "973a469b8db94e0a74db1ab7bb887b13e5e4d80f", package = "trouble_audio", default-features = false, features = ["defmt", "nrf-sdc"] }
+trouble-audio-example-apps = { git = "https://github.com/LegitCamper/trouble_audio", rev = "973a469b8db94e0a74db1ab7bb887b13e5e4d80f", features = ["defmt"] }
+trouble-host = { git = "https://github.com/LegitCamper/trouble", branch = "fix/iso-disconnection-events", features = ["derive", "scan", "gatt", "central", "security", "iso", "default-packet-pool"] }
 
 [lints.rust]
 future-incompatible = "warn"
