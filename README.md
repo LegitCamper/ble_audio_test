@@ -28,3 +28,27 @@ Connect nRF54L15 `P1.14` / `SERIAL21 TX` to XIAO `D7` / `GPIO1` / `UART0 RX`. UA
 USB hosting, DAC setup, UART transport, and the earlier mono path have run on hardware. Full stereo
 end-to-end timing and long-duration stability still need hardware validation; the RP2350 currently
 runs at an experimental 300 MHz overclock.
+
+## Audio timing and local codec
+
+The startup/rebuffer threshold is six 10 ms PCM blocks (60 ms). USB output consumes
+PCM in chunks per packet, and ring occupancy controls interpolated sample insertion
+or removal. Sequence gaps trigger LC3 packet-loss concealment for up to four missing
+stereo blocks per gap. The nRF queues raw LC3 pairs and frames them in its UART task.
+
+The RP2350 uses a locally vendored Apache-2.0 LC3 decoder with integer bit/pitch
+math, fixed TNS/global-gain tables, and cached MDCT normalization. See
+[vendor provenance and validation commands](crates/lc3-codec/VENDOR.md).
+
+Use the firmware counters to guide further optimization:
+
+- `max_stereo_decode_us > 10_000` indicates a stereo decode exceeded one frame period.
+- Sustained `last_100_blocks_us > 1_000_000` indicates that the producer is delivering
+  fewer than 100 stereo blocks per second; correlate with transport-loss counters.
+- Falling `buffered_blocks` while `inserted_frames` rises indicates correction cannot
+  keep up with the supply deficit; correlate with decode timing and sequence gaps.
+- `dropped_pairs`, `unpaired_lc3`, and `rejected_wire` identify transport/pairing losses.
+  `concealed_blocks` and `max_stereo_plc_us` show concealment activity and its cost.
+
+SRAM placement, splitting channel decoding across cores, and further nRF tuning
+remain options if hardware measurements show insufficient headroom.

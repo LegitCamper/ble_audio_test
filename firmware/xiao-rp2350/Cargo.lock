@@ -923,8 +923,6 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 [[package]]
 name = "lc3-codec"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba01b209b6df33864b21e0d987689ad8e497b9a49f59bf75be0c1cf3bb47f2f4"
 dependencies = [
  "bitvec",
  "byteorder",

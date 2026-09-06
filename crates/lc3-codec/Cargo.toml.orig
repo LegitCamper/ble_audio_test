@@ -1,0 +1,40 @@
+[package]
+name = "lc3-codec"
+version = "0.2.0"
+authors = ["David Haig"]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/ninjasource/lc3-codec.git"
+description = "An implementation of the LC3 audio codec for embedded systems (no_std)"
+keywords = ["lc3", "audio", "embedded", "no_std"]
+categories = ["embedded", "no-std", "multimedia"]
+readme = "README.md"
+
+[dependencies]
+byteorder = { version = "1.3.4", default-features = false }
+heapless = { version = "0.7.10", default-features = false }
+itertools = { version = "0.10.3", default-features = false }
+num-traits = { version = "0.2.14", default-features = false, features = ["libm"] }
+log = { version = "0.4", default-features = false }
+fast-math = "0.1.1"
+bitvec = { version = "1.0.0", default-features = false } # seems to need an alloc
+
+[dev-dependencies]
+log = { version = "0.4", default-features = false }
+simple_logger = { version = "1.11.0", default-features = false }
+
+# this is for benchmarking
+# criterion = "0.3"
+
+[profile.release]
+debug = true
+codegen-units = 1 # better optimizations
+lto = true # better optimizations
+
+#[[bench]]
+#name = "modified_dct_decode"
+#harness = false
+
+[features]
+default = ["alloc"]
+alloc = []

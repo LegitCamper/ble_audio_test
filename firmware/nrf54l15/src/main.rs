@@ -12,8 +12,7 @@ use core::cell::RefCell;
 use core::mem::MaybeUninit;
 
 use ble_audio_link::{
-    AudioEncoding, Channel, EncodedFrame, FrameDuration as LinkFrameDuration, FrameFlags, FrameMeta, VolumeCommand,
-    encode,
+    AudioEncoding, Channel, FrameDuration as LinkFrameDuration, FrameFlags, FrameMeta, VolumeCommand, encode,
 };
 use defmt::unwrap;
 use embassy_executor::{InterruptExecutor, Spawner};
@@ -89,9 +88,14 @@ const PENDING_FRAMES_PER_CHANNEL: usize = 8;
 const MAXIMUM_INITIAL_ALIGNMENT_SKEW_US: u32 = 5_000;
 const STREAM_IDLE_RESET_US: u32 = 100_000;
 
-struct StereoEncodedPair {
-    left: EncodedFrame,
-    right: EncodedFrame,
+struct StereoLc3Pair {
+    left_ase_id: u8,
+    right_ase_id: u8,
+    sequence: u16,
+    timestamp_us: u32,
+    flags: FrameFlags,
+    left: Lc3Frame,
+    right: Lc3Frame,
 }
 
 struct PendingLc3 {
@@ -197,7 +201,7 @@ fn sequence_is_after(sequence: u16, reference: u16) -> bool {
     distance != 0 && distance < 0x8000
 }
 
-static LC3_TX_QUEUE: AsyncChannel<CriticalSectionRawMutex, StereoEncodedPair, 4> = AsyncChannel::new();
+static LC3_TX_QUEUE: AsyncChannel<CriticalSectionRawMutex, StereoLc3Pair, 4> = AsyncChannel::new();
 /// Volume settings waiting to be forwarded to the RP2350.
 ///
 /// Kept separate from [`LC3_TX_QUEUE`] and holding the two-byte command rather than an encoded
@@ -247,7 +251,35 @@ async fn uart_tx_task(mut uart: UarteTx<'static>) -> ! {
         // queued value.
         match select(LC3_TX_QUEUE.receive(), VOLUME_TX_QUEUE.receive()).await {
             Either::First(pair) => {
-                if uart.write(pair.left.as_bytes()).await.is_err() || uart.write(pair.right.as_bytes()).await.is_err() {
+                let left_meta = FrameMeta {
+                    encoding: AudioEncoding::Lc3,
+                    channel: Channel::Left,
+                    ase_id: pair.left_ase_id,
+                    sequence: pair.sequence,
+                    timestamp_us: pair.timestamp_us,
+                    sample_rate_hz: 48_000,
+                    frame_duration: LinkFrameDuration::Millis10,
+                    flags: pair.flags,
+                };
+                let Ok(encoded) = encode(left_meta, &pair.left) else {
+                    defmt::warn!("left LC3 frame exceeded link capacity");
+                    continue;
+                };
+                if uart.write(encoded.as_bytes()).await.is_err() {
+                    defmt::warn!("stereo LC3 UART write failed");
+                    continue;
+                }
+
+                let right_meta = FrameMeta {
+                    channel: Channel::Right,
+                    ase_id: pair.right_ase_id,
+                    ..left_meta
+                };
+                let Ok(encoded) = encode(right_meta, &pair.right) else {
+                    defmt::warn!("right LC3 frame exceeded link capacity");
+                    continue;
+                };
+                if uart.write(encoded.as_bytes()).await.is_err() {
                     defmt::warn!("stereo LC3 UART write failed");
                     continue;
                 }
@@ -340,31 +372,16 @@ async fn forward_lc3(
             flags = flags.union(FrameFlags::DISCONTINUITY);
         }
 
-        let left_meta = FrameMeta {
-            encoding: AudioEncoding::Lc3,
-            channel: Channel::Left,
-            ase_id: left.ase_id,
+        let pair = StereoLc3Pair {
+            left_ase_id: left.ase_id,
+            right_ase_id: right.ase_id,
             sequence,
             timestamp_us,
-            sample_rate_hz: 48_000,
-            frame_duration: LinkFrameDuration::Millis10,
             flags,
+            left: left.frame,
+            right: right.frame,
         };
-        let right_meta = FrameMeta {
-            encoding: AudioEncoding::Lc3,
-            channel: Channel::Right,
-            ase_id: right.ase_id,
-            sequence,
-            timestamp_us,
-            sample_rate_hz: 48_000,
-            frame_duration: LinkFrameDuration::Millis10,
-            flags,
-        };
-        let (Ok(left), Ok(right)) = (encode(left_meta, &left.frame), encode(right_meta, &right.frame)) else {
-            defmt::warn!("stereo LC3 frame exceeded link capacity");
-            continue;
-        };
-        if LC3_TX_QUEUE.try_send(StereoEncodedPair { left, right }).is_err() {
+        if LC3_TX_QUEUE.try_send(pair).is_err() {
             dropped_pairs = dropped_pairs.wrapping_add(1);
             queue_overflowed = true;
         } else {

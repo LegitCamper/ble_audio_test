@@ -31,14 +31,12 @@ const CORE1_STACK_SIZE: usize = 64 * 1024;
 const SYSTEM_CLOCK_HZ: u32 = 300_000_000;
 const _: () = assert!(usb_audio::SAMPLE_RATE_HZ == audio::SAMPLE_RATE_HZ);
 const PCM_PREBUFFER_BLOCKS: usize = 6;
-const PCM_LOW_WATERMARK_BLOCKS: usize = 4;
-const PCM_HIGH_WATERMARK_BLOCKS: usize = 12;
-const PCM_CORRECTION_INTERVAL_FRAMES: usize = 4_096;
-const _: () = assert!(
-    PCM_LOW_WATERMARK_BLOCKS < PCM_PREBUFFER_BLOCKS
-        && PCM_PREBUFFER_BLOCKS < PCM_HIGH_WATERMARK_BLOCKS
-        && PCM_HIGH_WATERMARK_BLOCKS < audio::PCM_RING_CAPACITY
-);
+const PCM_TARGET_BLOCKS: usize = PCM_PREBUFFER_BLOCKS;
+const PCM_HIGH_DEADBAND_BLOCKS: usize = PCM_TARGET_BLOCKS + 1;
+const PCM_NEAR_CORRECTION_INTERVAL_FRAMES: usize = 1_536;
+const PCM_FAR_CORRECTION_INTERVAL_FRAMES: usize = 384;
+const PCM_CRITICAL_CORRECTION_INTERVAL_FRAMES: usize = 96;
+const _: () = assert!(PCM_HIGH_DEADBAND_BLOCKS < audio::PCM_RING_CAPACITY);
 
 static mut CORE1_STACK: Stack<CORE1_STACK_SIZE> = Stack::new();
 static EXECUTOR_CORE0: StaticCell<Executor> = StaticCell::new();
@@ -112,18 +110,23 @@ impl PcmReader {
         self.received_blocks = self.received_blocks.wrapping_add(1);
     }
 
-    fn discard_source_frame(&mut self) -> bool {
+    fn peek_source_frame(&mut self) -> Option<(i16, i16)> {
         self.release_finished_block();
-        let Some(block) = self.receiver.try_receive() else {
-            return false;
-        };
+        let block = self.receiver.try_receive()?;
+        Some((block.left[self.frame_index], block.right[self.frame_index]))
+    }
+
+    fn discard_source_frame(&mut self) -> Option<(i16, i16)> {
+        self.release_finished_block();
+        let block = self.receiver.try_receive()?;
         let block_metadata = (self.frame_index == 0).then_some((block.sequence, block.timestamp_us));
+        let discarded = (block.left[self.frame_index], block.right[self.frame_index]);
         self.frame_index += 1;
         if let Some((sequence, timestamp_us)) = block_metadata {
             self.start_source_block(sequence, timestamp_us);
         }
         self.release_finished_block();
-        true
+        Some(discarded)
     }
 
     fn fill_packet(&mut self, stereo_frames: usize, output: &mut [u8]) {
@@ -139,17 +142,26 @@ impl PcmReader {
         }
 
         let mut output_frames = output.chunks_exact_mut(4);
+        let mut discarded_frame = None;
         if self.correction_cooldown_frames == 0 {
             let buffered_blocks = self.receiver.len();
-            if buffered_blocks <= PCM_LOW_WATERMARK_BLOCKS {
-                if let (Some((left, right)), Some(frame)) = (self.last_frame, output_frames.next()) {
-                    write_stereo_frame(frame, left, right);
+            if buffered_blocks < PCM_TARGET_BLOCKS {
+                if let Some(previous) = self.last_frame
+                    && let Some(next) = self.peek_source_frame()
+                    && let Some(frame) = output_frames.next()
+                {
+                    let inserted = midpoint_stereo_frame(previous, next);
+                    write_stereo_frame(frame, inserted.0, inserted.1);
+                    self.last_frame = Some(inserted);
                     self.inserted_frames = self.inserted_frames.wrapping_add(1);
-                    self.correction_cooldown_frames = PCM_CORRECTION_INTERVAL_FRAMES;
+                    self.correction_cooldown_frames = correction_interval(PCM_TARGET_BLOCKS - buffered_blocks);
                 }
-            } else if buffered_blocks >= PCM_HIGH_WATERMARK_BLOCKS && self.discard_source_frame() {
-                self.discarded_frames = self.discarded_frames.wrapping_add(1);
-                self.correction_cooldown_frames = PCM_CORRECTION_INTERVAL_FRAMES;
+            } else if buffered_blocks > PCM_HIGH_DEADBAND_BLOCKS {
+                discarded_frame = self.discard_source_frame();
+                if discarded_frame.is_some() {
+                    self.discarded_frames = self.discarded_frames.wrapping_add(1);
+                    self.correction_cooldown_frames = correction_interval(buffered_blocks - PCM_HIGH_DEADBAND_BLOCKS);
+                }
             }
         }
 
@@ -172,8 +184,11 @@ impl PcmReader {
                 .take(copied_frames)
                 .zip(block.left[source_range.clone()].iter().zip(&block.right[source_range]))
             {
-                write_stereo_frame(frame, left, right);
-                last_frame = Some((left, right));
+                let output = discarded_frame.take().map_or((left, right), |discarded| {
+                    midpoint_stereo_frame(discarded, (left, right))
+                });
+                write_stereo_frame(frame, output.0, output.1);
+                last_frame = Some(output);
             }
             self.frame_index += copied_frames;
             self.last_frame = last_frame;
@@ -183,6 +198,19 @@ impl PcmReader {
         }
         self.release_finished_block();
     }
+}
+
+const fn correction_interval(distance_blocks: usize) -> usize {
+    match distance_blocks {
+        0 | 1 => PCM_NEAR_CORRECTION_INTERVAL_FRAMES,
+        2 => PCM_FAR_CORRECTION_INTERVAL_FRAMES,
+        _ => PCM_CRITICAL_CORRECTION_INTERVAL_FRAMES,
+    }
+}
+
+fn midpoint_stereo_frame(first: (i16, i16), second: (i16, i16)) -> (i16, i16) {
+    let midpoint = |a, b| ((i32::from(a) + i32::from(b)) / 2) as i16;
+    (midpoint(first.0, second.0), midpoint(first.1, second.1))
 }
 
 fn write_stereo_frame(output: &mut [u8], left: i16, right: i16) {

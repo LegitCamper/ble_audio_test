@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/audio-link",
+    "crates/lc3-codec",
     "crates/uac-descriptor",
 ]
 default-members = [

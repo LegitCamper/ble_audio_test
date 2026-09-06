@@ -3,7 +3,7 @@
 use core::sync::atomic::Ordering;
 
 use ble_audio_link::{
-    AudioEncoding, Channel, DecodedFrame, FrameDuration as LinkFrameDuration, StreamDecoder, VolumeCommand,
+    AudioEncoding, Channel, DecodedFrame, FrameDuration as LinkFrameDuration, FrameFlags, StreamDecoder, VolumeCommand,
 };
 use embassy_rp::spinlock_mutex::SpinlockRawMutex;
 use embassy_rp::uart::BufferedUartRx;
@@ -24,6 +24,8 @@ pub const SAMPLES_PER_CHANNEL: usize = (SAMPLE_RATE_HZ / 100) as usize;
 pub const PCM_RING_CAPACITY: usize = 16;
 
 const DECODER_CHANNELS: usize = 2;
+const MAX_CONCEALED_BLOCKS_PER_GAP: u16 = 4;
+const FRAME_DURATION_US: u32 = 10_000;
 const CODEC_FRAME_DURATION: CodecFrameDuration = CodecFrameDuration::TenMs;
 const CODEC_SAMPLE_RATE: SamplingFrequency = SamplingFrequency::Hz48000;
 const DECODER_BUFFER_LENGTHS: (usize, usize) =
@@ -195,8 +197,13 @@ pub async fn run(mut uart: BufferedUartRx, mut pcm: PcmSender) -> ! {
     let mut stereo_blocks = 0_u32;
     let mut dropped_blocks = 0_u32;
     let mut failed_channels = 0_u32;
+    let mut concealed_blocks = 0_u32;
+    let mut unconcealed_blocks = 0_u32;
     let mut rejected_wire_frames = 0_u32;
     let mut maximum_stereo_decode_us = 0_u64;
+    let mut maximum_stereo_plc_us = 0_u64;
+    let mut last_decoded_sequence = None;
+    let mut last_decoded_timestamp_us = 0_u32;
     let mut report_started = Instant::now();
 
     loop {
@@ -251,6 +258,49 @@ pub async fn run(mut uart: BufferedUartRx, mut pcm: PcmSender) -> ! {
             let Some((left, right)) = pairer.push(frame) else {
                 continue;
             };
+            let sequence = left.meta.sequence;
+            let starts_stream = left.meta.flags.contains(FrameFlags::STREAM_START);
+            let missing_blocks = if starts_stream {
+                0
+            } else {
+                last_decoded_sequence.map_or(0, |previous: u16| {
+                    let distance = sequence.wrapping_sub(previous).wrapping_sub(1);
+                    if distance < 0x8000 { distance } else { 0 }
+                })
+            };
+            let conceal_blocks = missing_blocks.min(MAX_CONCEALED_BLOCKS_PER_GAP);
+            unconcealed_blocks = unconcealed_blocks.wrapping_add(u32::from(missing_blocks - conceal_blocks));
+            let concealment_base_sequence = last_decoded_sequence.unwrap_or(sequence.wrapping_sub(missing_blocks + 1));
+            let concealment_base_timestamp_us = last_decoded_timestamp_us;
+
+            for offset in 1..=conceal_blocks {
+                let Some(block) = pcm.try_send() else {
+                    dropped_blocks = dropped_blocks.wrapping_add(1);
+                    break;
+                };
+                let started = Instant::now();
+                let left_status = decoder.decode_frame(16, 0, &[], &mut block.left);
+                let right_status = decoder.decode_frame(16, 1, &[], &mut block.right);
+                maximum_stereo_plc_us = maximum_stereo_plc_us.max((Instant::now() - started).as_micros());
+                if left_status.is_err() || right_status.is_err() {
+                    failed_channels = failed_channels
+                        .wrapping_add(u32::from(left_status.is_err()))
+                        .wrapping_add(u32::from(right_status.is_err()));
+                    break;
+                }
+
+                let concealed_sequence = concealment_base_sequence.wrapping_add(offset);
+                let concealed_timestamp_us =
+                    concealment_base_timestamp_us.wrapping_add(u32::from(offset) * FRAME_DURATION_US);
+                block.sequence = concealed_sequence;
+                block.timestamp_us = concealed_timestamp_us;
+                pcm.send_done();
+                last_decoded_sequence = Some(concealed_sequence);
+                last_decoded_timestamp_us = concealed_timestamp_us;
+                concealed_blocks = concealed_blocks.wrapping_add(1);
+                mark_progress(AudioProgress::StereoQueued);
+            }
+
             let Some(block) = pcm.try_send() else {
                 dropped_blocks = dropped_blocks.wrapping_add(1);
                 continue;
@@ -275,6 +325,8 @@ pub async fn run(mut uart: BufferedUartRx, mut pcm: PcmSender) -> ! {
             block.sequence = left.meta.sequence;
             block.timestamp_us = left.meta.timestamp_us;
             pcm.send_done();
+            last_decoded_sequence = Some(sequence);
+            last_decoded_timestamp_us = left.meta.timestamp_us;
 
             mark_progress(AudioProgress::Lc3Decoded);
             mark_progress(AudioProgress::StereoQueued);
@@ -285,11 +337,14 @@ pub async fn run(mut uart: BufferedUartRx, mut pcm: PcmSender) -> ! {
                 let report_us = (now - report_started).as_micros();
                 report_started = now;
                 defmt::info!(
-                    "stereo_blocks={} decoded_lc3={} failed_lc3={} max_stereo_decode_us={} dropped_pcm={} unpaired_lc3={} rejected_wire={} last_100_blocks_us={}",
+                    "stereo_blocks={} decoded_lc3={} failed_lc3={} max_stereo_decode_us={} concealed_blocks={} max_stereo_plc_us={} unconcealed_blocks={} dropped_pcm={} unpaired_lc3={} rejected_wire={} last_100_blocks_us={}",
                     stereo_blocks,
                     decoded_channels,
                     failed_channels,
                     maximum_stereo_decode_us,
+                    concealed_blocks,
+                    maximum_stereo_plc_us,
+                    unconcealed_blocks,
                     dropped_blocks,
                     pairer.discarded,
                     rejected_wire_frames,

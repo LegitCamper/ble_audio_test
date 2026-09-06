@@ -42,7 +42,7 @@ embassy-usb-driver = { git = "https://github.com/LegitCamper/embassy", rev = "76
   "defmt",
 ] }
 embedded-io-async = "0.7"
-lc3-codec = { version = "=0.2.0", default-features = false }
+lc3-codec = { path = "../../crates/lc3-codec", default-features = false }
 panic-probe = { version = "1", features = ["print-defmt"] }
 portable-atomic = { version = "1", features = ["critical-section"] }
 static_cell = "2"
