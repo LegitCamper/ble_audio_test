@@ -7,9 +7,11 @@ extern crate alloc;
 
 mod audio_sink;
 mod bond_store;
+mod watchdog;
 
 use core::cell::RefCell;
 use core::mem::MaybeUninit;
+use core::sync::atomic::{AtomicU16, Ordering};
 
 use ble_audio_link::{
     AudioEncoding, Channel, FrameDuration as LinkFrameDuration, FrameFlags, FrameMeta, VolumeCommand, encode,
@@ -22,10 +24,11 @@ use embassy_nrf::interrupt;
 use embassy_nrf::interrupt::{InterruptExt, Priority};
 use embassy_nrf::nvmc::Nvmc;
 use embassy_nrf::uarte::{self, UarteTx};
+use embassy_nrf::wdt::{HaltConfig, SleepConfig, Watchdog, WatchdogHandle};
 use embassy_nrf::{bind_interrupts, config, cracen, mode::Blocking, peripherals};
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::channel::Channel as AsyncChannel;
-use embassy_time::Instant;
+use embassy_time::{Instant, Timer};
 use embedded_alloc::LlffHeap as Heap;
 use heapless::Deque;
 use nrf_sdc::mpsl::MultiprotocolServiceLayer;
@@ -207,6 +210,7 @@ static LC3_TX_QUEUE: AsyncChannel<CriticalSectionRawMutex, StereoLc3Pair, 4> = A
 /// Kept separate from [`LC3_TX_QUEUE`] and holding the two-byte command rather than an encoded
 /// frame, so a volume change neither displaces queued audio nor costs a full wire-frame buffer.
 static VOLUME_TX_QUEUE: AsyncChannel<CriticalSectionRawMutex, VolumeCommand, 2> = AsyncChannel::new();
+static LATEST_VOLUME: AtomicU16 = AtomicU16::new(0xffff);
 static UART_EXECUTOR: InterruptExecutor = InterruptExecutor::new();
 
 #[interrupt]
@@ -218,15 +222,33 @@ unsafe fn SWI01() {
 
 /// Queues a volume setting for the RP2350.
 ///
-/// Dropping the setting when the queue is full is safe: only the newest value matters, and the
-/// queue only fills if the UART is already wedged.
+/// Keep the latest setting even if the immediate queue is full; periodic replay retries it.
 fn send_volume(command: VolumeCommand) {
+    LATEST_VOLUME.store(
+        u16::from(command.level) | (u16::from(command.muted) << 8),
+        Ordering::Relaxed,
+    );
     if VOLUME_TX_QUEUE.try_send(command).is_err() {
         defmt::warn!(
             "volume queue full; dropped level={} muted={}",
             command.level,
             command.muted
         );
+    }
+}
+
+/// The one-way UART cannot announce an XIAO reset, so replay current volume periodically.
+#[embassy_executor::task]
+async fn volume_replay_task() -> ! {
+    loop {
+        Timer::after_secs(1).await;
+        let packed = LATEST_VOLUME.load(Ordering::Relaxed);
+        if packed != 0xffff {
+            let _ = VOLUME_TX_QUEUE.try_send(VolumeCommand {
+                level: packed as u8,
+                muted: packed & 0x100 != 0,
+            });
+        }
     }
 }
 
@@ -243,13 +265,13 @@ fn channel_from_allocation(allocation: Option<AudioLocation>) -> Option<Channel>
 }
 
 #[embassy_executor::task]
-async fn uart_tx_task(mut uart: UarteTx<'static>) -> ! {
+async fn uart_tx_task(mut uart: UarteTx<'static>, mut watchdog: WatchdogHandle) -> ! {
     let mut transmitted_pairs = 0_u32;
     let mut volume_sequence = 0_u16;
     loop {
         // Neither branch consumes its item until it is selected, so losing the race cannot drop a
         // queued value.
-        match select(LC3_TX_QUEUE.receive(), VOLUME_TX_QUEUE.receive()).await {
+        match watchdog::idle_wait(&mut watchdog, select(LC3_TX_QUEUE.receive(), VOLUME_TX_QUEUE.receive())).await {
             Either::First(pair) => {
                 let left_meta = FrameMeta {
                     encoding: AudioEncoding::Lc3,
@@ -319,6 +341,7 @@ async fn uart_tx_task(mut uart: UarteTx<'static>) -> ! {
 async fn forward_lc3(
     led: &mut Output<'static>,
     cis_manager: &CisManager<NoopRawMutex, { basic_audio_sink::MAX_ASES }>,
+    mut watchdog: WatchdogHandle,
 ) -> ! {
     let mut last_sequence: Option<u16> = None;
     let mut last_timestamp_us = 0_u32;
@@ -331,7 +354,7 @@ async fn forward_lc3(
     let mut report_started = Instant::now();
 
     loop {
-        let raw = cis_manager.receive_lc3().await;
+        let raw = watchdog::idle_wait(&mut watchdog, cis_manager.receive_lc3()).await;
         let Some(channel) = channel_from_allocation(raw.channel_allocation) else {
             defmt::warn!("ignored ASE {} without a single left/right allocation", raw.ase_id);
             continue;
@@ -427,6 +450,27 @@ async fn main(spawner: Spawner) {
     config.lfclk_source = config::LfclkSource::ExternalXtal;
     let p = embassy_nrf::init(config);
 
+    let reset_reason = embassy_nrf::pac::RESET_S.resetreas().read();
+    embassy_nrf::pac::RESET_S.resetreas().write_value(reset_reason);
+    let mut watchdog_config = embassy_nrf::wdt::Config::default();
+    watchdog_config.timeout_ticks = 5 * 32_768;
+    watchdog_config.action_during_sleep = SleepConfig::Run;
+    watchdog_config.action_during_debug_halt = HaltConfig::Pause;
+    let (mut watchdog, [main_watchdog, uart_watchdog]) = match Watchdog::try_new(p.WDT1, watchdog_config) {
+        Ok(watchdog) => watchdog,
+        Err(_) => {
+            // An already-running WDT cannot be reconfigured. Let it reset the system.
+            loop {
+                cortex_m::asm::wfi();
+            }
+        }
+    };
+    watchdog.disable_interrupt();
+    defmt::info!(
+        "reset reasons={:#x}; watchdog timeout=5s handles=main,uart",
+        reset_reason.0
+    );
+
     static LED: StaticCell<Output> = StaticCell::new();
     let led = LED.init(Output::new(p.P0_02, Level::Low, OutputDrive::Standard));
 
@@ -497,10 +541,11 @@ async fn main(spawner: Spawner) {
     defmt::info!("stereo LC3 UART ready: SERIAL21 TX=P1.14 baud=1000000");
     interrupt::SWI01.set_priority(Priority::P6);
     let uart_spawner = UART_EXECUTOR.start(interrupt::SWI01);
-    uart_spawner.spawn(unwrap!(uart_tx_task(uart)));
+    uart_spawner.spawn(unwrap!(uart_tx_task(uart, uart_watchdog)));
+    spawner.spawn(unwrap!(volume_replay_task()));
 
     let _ = select(
-        forward_lc3(led, cis_manager),
+        forward_lc3(led, cis_manager, main_watchdog),
         audio_sink::run(sdc, cis_manager, &bond_store),
     )
     .await;

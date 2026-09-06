@@ -315,6 +315,13 @@ mod tests {
     use super::*;
     use crate::common::config::{FrameDuration, SamplingFrequency};
 
+    #[test]
+    fn truncated_side_info_returns_error_instead_of_panicking() {
+        let config = Lc3Config::new(SamplingFrequency::Hz48000, FrameDuration::TenMs);
+        let mut spectral = [0; MAX_LEN_SPECTRAL];
+        assert!(read_frame(&[226, 149, 228, 88], &config, &mut spectral).is_err());
+    }
+
     #[cfg(not(feature = "alloc"))]
     #[test]
     fn lc3_decode_channel() {

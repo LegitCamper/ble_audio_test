@@ -15,6 +15,11 @@ package lockfile, and upstream editor settings are omitted.
 
 Local changes:
 
+- `decoder/buffer_reader.rs` checks the actual input boundary before reading a tail
+  bit. Empty/exhausted buffers and a reproduced four-byte truncated LC3 frame now
+  return errors instead of panicking. Arithmetic-decoder head read-ahead remains
+  supported, and original PCM vectors still pass.
+
 - `decoder/arithmetic_codec.rs` and `decoder/side_info_reader.rs` use integer
   leading-zero counts instead of floating-point logarithms for bit counts.
 - `decoder/long_term_post_filter.rs` uses exact rational integer arithmetic for

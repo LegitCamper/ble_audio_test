@@ -29,6 +29,41 @@ USB hosting, DAC setup, UART transport, and the earlier mono path have run on ha
 end-to-end timing and long-duration stability still need hardware validation; the RP2350 currently
 runs at an experimental 300 MHz overclock.
 
+## Watchdog recovery and clock diagnosis
+
+Both firmwares start a five-second hardware watchdog immediately after HAL initialization.
+The XIAO requires fresh progress from both USB and UART/LC3 tasks before reloading it;
+the nRF requires independent reloads from the main forwarding path and UART transmitter.
+Normal waits for a DAC, BLE audio, or UART input remain healthy indefinitely. USB setup,
+USB control transfers, SOF waits, decoding, and UART writes cannot feed through a hang.
+Watchdogs run during normal sleep and pause when a debugger halts a core. RTT logging
+is forced nonblocking so a disconnected logging session cannot freeze the firmware.
+
+The XIAO yellow LED flashes **once on normal startup, three times after a watchdog
+timeout**, then returns to its playback indication. Watchdog scratch registers retain
+a timeout count and the last missing-task mask for RTT diagnostics; these are not a
+power-loss-persistent crash log. The nRF logs and clears its hardware reset-reason bits.
+After an XIAO reset or DAC reconnect, packets remain silent until volume is applied.
+The nRF replays current volume/mute every second; unchanged settings do not cause
+repeated USB control requests. Update both boards together for this recovery behavior.
+
+Default XIAO builds retain **300 MHz / 1.25 V** because the existing implementation
+records stereo underflows at 225 MHz. For comparison at rated **150 MHz / 1.10 V**,
+build from `firmware/xiao-rp2350`:
+
+```sh
+cargo build --release --locked --features stock-clock
+```
+
+Use the usual BOOTSEL UF2 flashing procedure, or `cargo run --release --locked
+--features stock-clock` with the BOOTSEL drive mounted. Omit `--features stock-clock`
+to restore the playback build. At 150 MHz expect possible audio underflows: compare
+resets/freezes separately from uninterrupted playback. A stable diagnostic run would
+implicate the clock/voltage/load combination, but would not isolate its exact cause.
+
+See the [stability review and hardware checks](plans/stability-review.md) for findings,
+watchdog coverage limits, and the remaining validation work.
+
 ## Audio timing and local codec
 
 The startup/rebuffer threshold is six 10 ms PCM blocks (60 ms). USB output consumes

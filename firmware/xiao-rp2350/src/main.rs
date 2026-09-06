@@ -6,6 +6,7 @@
 mod audio;
 mod iso;
 mod usb_audio;
+mod watchdog;
 
 use defmt::unwrap;
 use embassy_executor::Executor;
@@ -16,9 +17,10 @@ use embassy_rp::gpio::{Level, Output};
 use embassy_rp::multicore::{Stack, spawn_core1};
 use embassy_rp::peripherals::{UART0, USB};
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUartRx, Config as UartConfig};
-use embassy_time::Instant;
+use embassy_rp::watchdog::Watchdog;
+use embassy_time::{Duration, Instant, Timer};
 use embassy_usb::host::UsbHostBusExt;
-use embassy_usb_driver::host::{DeviceEvent, UsbHostDriver};
+use embassy_usb_driver::Speed;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -28,7 +30,10 @@ use crate::audio::{PcmReceiver, PcmSender};
 use crate::usb_audio::{MINIMUM_PACKET_FRAMES, NOMINAL_PACKET_FRAMES, UsbAudioPlayback, VolumeOwner};
 
 const CORE1_STACK_SIZE: usize = 64 * 1024;
+#[cfg(not(feature = "stock-clock"))]
 const SYSTEM_CLOCK_HZ: u32 = 300_000_000;
+#[cfg(feature = "stock-clock")]
+const SYSTEM_CLOCK_HZ: u32 = 150_000_000;
 const _: () = assert!(usb_audio::SAMPLE_RATE_HZ == audio::SAMPLE_RATE_HZ);
 const PCM_PREBUFFER_BLOCKS: usize = 6;
 const PCM_TARGET_BLOCKS: usize = PCM_PREBUFFER_BLOCKS;
@@ -278,20 +283,49 @@ async fn audio_ingest_task(uart: BufferedUartRx, pcm: PcmSender) -> ! {
     audio::run(uart, pcm).await
 }
 
+fn attached_speed() -> Option<Speed> {
+    match embassy_rp::pac::USB.sie_status().read().speed() {
+        0b01 => Some(Speed::Low),
+        0b10 => Some(Speed::Full),
+        _ => None,
+    }
+}
+
+async fn wait_for_dac() -> Speed {
+    loop {
+        if let Some(speed) = attached_speed() {
+            return speed;
+        }
+        Timer::after_millis(20).await;
+    }
+}
+
+async fn wait_for_dac_removal() {
+    while attached_speed().is_some() {
+        Timer::after_millis(20).await;
+    }
+}
+
 #[embassy_executor::task]
 async fn usb_task(
     mut host: embassy_rp::usb::host::Driver<'static, USB>,
     mut led: StatusLed,
     pcm_receiver: PcmReceiver,
+    watchdog_reset: bool,
 ) -> ! {
+    // Visible without a probe: one startup flash, three after a watchdog timeout.
+    for _ in 0..if watchdog_reset { 3 } else { 1 } {
+        led.user.set_low();
+        watchdog::idle_wait(watchdog::Task::Usb, Timer::after_millis(120)).await;
+        led.user.set_high();
+        watchdog::idle_wait(watchdog::Task::Usb, Timer::after_millis(120)).await;
+    }
     led.show(BridgeState::WaitingForDac);
     let mut pcm = PcmReader::new(pcm_receiver);
     loop {
-        let speed = loop {
-            if let DeviceEvent::Connected(speed) = host.wait_for_device_event().await {
-                break speed;
-            }
-        };
+        // The pinned driver's event wait only observes edges. Read the port level so
+        // a DAC present during startup flashes or a watchdog reset is enumerated too.
+        let speed = watchdog::idle_wait(watchdog::Task::Usb, wait_for_dac()).await;
         defmt::info!("USB device connected at {:?}", speed);
 
         let enumeration = match host.enumerate_root_bare(speed, 1).await {
@@ -305,7 +339,7 @@ async fn usb_task(
             Ok(playback) => playback,
             Err(error) => {
                 defmt::warn!("USB Audio setup failed: {:?}", error);
-                let _ = host.wait_for_device_event().await;
+                watchdog::idle_wait(watchdog::Task::Usb, wait_for_dac_removal()).await;
                 continue;
             }
         };
@@ -321,6 +355,8 @@ async fn usb_task(
         let mut cadence_started = Instant::now();
         let mut cadence_pcm_frames = 0_u32;
         let mut transaction_failures = 0_u32;
+        let mut applied_volume = None;
+        let mut volume_retry_after = Instant::now();
         defmt::info!(
             "USB Audio playback started: rate={} feedback_interval_frames={} volume_owner={}",
             usb_audio::SAMPLE_RATE_HZ,
@@ -332,6 +368,7 @@ async fn usb_task(
         );
 
         loop {
+            watchdog::progress(watchdog::Task::Usb);
             if let Err(error) = playback.wait_for_sof().await {
                 defmt::info!("USB Audio device left the bus: {:?}", error);
                 led.show(BridgeState::WaitingForDac);
@@ -339,8 +376,13 @@ async fn usb_task(
             }
             let stereo_frames = rate.next_packet_frames();
             let packet_len = stereo_frames * 4;
-            if let Err(error) = playback.write_packet_with(packet_len, |packet| pcm.fill_packet(stereo_frames, packet))
-            {
+            if let Err(error) = playback.write_packet_with(packet_len, |packet| {
+                pcm.fill_packet(stereo_frames, packet);
+                // A bridge reset must not resume an existing BLE stream at default/full gain.
+                if applied_volume.is_none() {
+                    packet.fill(0);
+                }
+            }) {
                 transaction_failures = transaction_failures.wrapping_add(1);
                 if !playback.is_device_connected() {
                     defmt::info!("USB Audio device disconnected during write: {:?}", error);
@@ -379,10 +421,18 @@ async fn usb_task(
             // Applied straight after the audio write so a control transfer to a DAC-owned volume
             // never delays the isochronous packet. Volume changes are user-paced, so this costs
             // nothing on the overwhelming majority of frames.
-            if let Some(command) = audio::take_volume()
-                && let Err(error) = playback.set_volume(command.level, command.muted).await
+            if let Some(command) = audio::latest_volume()
+                && applied_volume != Some(command)
+                && Instant::now() >= volume_retry_after
             {
-                defmt::warn!("volume update failed: {:?}", error);
+                match playback.set_volume(command.level, command.muted).await {
+                    Ok(()) => applied_volume = Some(command),
+                    Err(error) => {
+                        defmt::warn!("volume update failed: {:?}", error);
+                        applied_volume = None;
+                        volume_retry_after = Instant::now() + Duration::from_secs(1);
+                    }
+                }
             }
 
             // Keep the time-critical audio OUT transaction first. A cheap Full-Speed DAC may
@@ -437,8 +487,14 @@ fn main() -> ! {
     let mut clocks = unwrap!(ClockConfig::system_freq(SYSTEM_CLOCK_HZ));
     // Stereo LC3 decoding underflows at 225 MHz. Sustained playback therefore needs the measured
     // decoder headroom at 300 MHz; independent source/DAC clock drift is handled in `PcmReader`.
-    clocks.core_voltage = CoreVoltage::V1_25;
+    clocks.core_voltage = if cfg!(feature = "stock-clock") {
+        CoreVoltage::V1_10
+    } else {
+        CoreVoltage::V1_25
+    };
     let p = embassy_rp::init(RpConfig::new(clocks));
+    let mut watchdog = Watchdog::new(p.WATCHDOG);
+    let watchdog_reset = watchdog::start(&mut watchdog);
     defmt::info!("RP2350 system clock={} Hz", embassy_rp::clocks::clk_sys_freq());
     let mut uart_config = UartConfig::default();
     uart_config.baudrate = 1_000_000;
@@ -462,5 +518,8 @@ fn main() -> ! {
     );
 
     let executor = EXECUTOR_CORE0.init(Executor::new());
-    executor.run(|spawner| spawner.spawn(unwrap!(usb_task(usb, led, pcm_receiver))));
+    executor.run(|spawner| {
+        spawner.spawn(unwrap!(watchdog::run(watchdog)));
+        spawner.spawn(unwrap!(usb_task(usb, led, pcm_receiver, watchdog_reset)));
+    });
 }

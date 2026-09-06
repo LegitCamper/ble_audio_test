@@ -99,12 +99,12 @@ impl BufferReader {
         let byte_index = self.tail_bit_cursor / 8;
         let bit_index = self.tail_bit_cursor % 8;
 
-        // FIXME: test this range check properly
-        if (buf.len() as i32 - self.head_byte_cursor as i32 - byte_index as i32 + 2) < 0 {
+        // The arithmetic decoder reads ahead at the head, so its byte cursor may
+        // overlap valid tail bits. Bound against the actual input, not that cursor.
+        let Some(from_index) = buf.len().checked_sub(byte_index + 1) else {
             return Err(BufferReaderError::BigEndianBitReaderReadBoolOutOfRange(bit_index));
-        }
+        };
 
-        let from_index = buf.len() - byte_index - 1;
         let mut byte = buf[from_index];
         byte <<= 7 - bit_index;
         byte >>= 7;
@@ -118,6 +118,21 @@ impl BufferReader {
 mod tests {
     extern crate std;
     use super::*;
+
+    #[test]
+    fn tail_bool_rejects_empty_input() {
+        assert!(BufferReader::new().read_tail_bool(&[]).is_err());
+    }
+
+    #[test]
+    fn tail_bool_rejects_exhausted_input_without_advancing() {
+        let mut reader = BufferReader::new();
+        for _ in 0..8 {
+            reader.read_tail_bool(&[0xff]).unwrap();
+        }
+        assert!(reader.read_tail_bool(&[0xff]).is_err());
+        assert_eq!(reader.get_tail_bit_cursor(), 8);
+    }
 
     #[test]
     fn read_5_bits_over_byte_boundary_unto_usize() {

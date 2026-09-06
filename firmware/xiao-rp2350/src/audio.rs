@@ -80,12 +80,9 @@ fn publish_volume(command: VolumeCommand) {
     VOLUME.store(packed, Ordering::Relaxed);
 }
 
-/// Takes the pending volume, if the source has sent one since the last call.
-///
-/// Consuming the value means the USB task only issues a control transfer when something actually
-/// changed, rather than on every packet.
-pub fn take_volume() -> Option<VolumeCommand> {
-    let packed = VOLUME.swap(NO_VOLUME, Ordering::Relaxed);
+/// Returns the latest volume, retained so a replacement DAC gets the same setting.
+pub fn latest_volume() -> Option<VolumeCommand> {
+    let packed = VOLUME.load(Ordering::Relaxed);
     if packed == NO_VOLUME {
         return None;
     }
@@ -207,7 +204,7 @@ pub async fn run(mut uart: BufferedUartRx, mut pcm: PcmSender) -> ! {
     let mut report_started = Instant::now();
 
     loop {
-        let received = match uart.read(&mut rx_buffer).await {
+        let received = match crate::watchdog::idle_wait(crate::watchdog::Task::Audio, uart.read(&mut rx_buffer)).await {
             Ok(count) => count,
             Err(error) => {
                 defmt::warn!("UART receive error: {:?}", error);

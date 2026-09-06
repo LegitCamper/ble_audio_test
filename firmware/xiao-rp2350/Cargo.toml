@@ -9,13 +9,18 @@ publish = false
 [workspace]
 resolver = "2"
 
+[features]
+# Rated-clock diagnostic build; stereo decoding may miss its 10 ms deadline.
+stock-clock = []
+
 [dependencies]
 ble-audio-link = { path = "../../crates/audio-link" }
 ble-audio-uac-descriptor = { path = "../../crates/uac-descriptor" }
 cortex-m = { version = "0.7.6", features = ["inline-asm"] }
 cortex-m-rt = "0.7"
 defmt = "1"
-defmt-rtt = "1"
+defmt-rtt = { version = "1", features = ["disable-blocking-mode"] }
+embassy-futures = { git = "https://github.com/LegitCamper/embassy", rev = "760eb3b8d4725432588d4ee54ebaaa10f012a564" }
 embassy-executor = { git = "https://github.com/LegitCamper/embassy", rev = "760eb3b8d4725432588d4ee54ebaaa10f012a564", features = [
   "arch-cortex-m",
   "executor-thread",
