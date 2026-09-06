@@ -58,6 +58,7 @@ struct PcmReader {
     underflows: u32,
     inserted_frames: u32,
     discarded_frames: u32,
+    missing_source_blocks: u32,
     last_left_sequence: u16,
     last_right_sequence: u16,
     last_timestamp_us: u32,
@@ -75,6 +76,7 @@ impl PcmReader {
             underflows: 0,
             inserted_frames: 0,
             discarded_frames: 0,
+            missing_source_blocks: 0,
             last_left_sequence: 0,
             last_right_sequence: 0,
             last_timestamp_us: 0,
@@ -90,22 +92,38 @@ impl PcmReader {
         self.receiver.len()
     }
 
-    fn next_source_frame(&mut self) -> Option<(i16, i16)> {
+    fn release_finished_block(&mut self) {
         if self.frame_index == SAMPLES_PER_CHANNEL {
             self.receiver.receive_done();
             self.frame_index = 0;
         }
+    }
 
-        let block = self.receiver.try_receive()?;
-        if self.frame_index == 0 {
-            self.last_left_sequence = block.sequence;
-            self.last_right_sequence = block.sequence;
-            self.last_timestamp_us = block.timestamp_us;
-            self.received_blocks = self.received_blocks.wrapping_add(1);
+    fn start_source_block(&mut self, sequence: u16, timestamp_us: u32) {
+        if self.received_blocks != 0 {
+            let missing = sequence.wrapping_sub(self.last_left_sequence).wrapping_sub(1);
+            if missing < 0x8000 {
+                self.missing_source_blocks = self.missing_source_blocks.wrapping_add(u32::from(missing));
+            }
         }
-        let frame = (block.left[self.frame_index], block.right[self.frame_index]);
+        self.last_left_sequence = sequence;
+        self.last_right_sequence = sequence;
+        self.last_timestamp_us = timestamp_us;
+        self.received_blocks = self.received_blocks.wrapping_add(1);
+    }
+
+    fn discard_source_frame(&mut self) -> bool {
+        self.release_finished_block();
+        let Some(block) = self.receiver.try_receive() else {
+            return false;
+        };
+        let block_metadata = (self.frame_index == 0).then_some((block.sequence, block.timestamp_us));
         self.frame_index += 1;
-        Some(frame)
+        if let Some((sequence, timestamp_us)) = block_metadata {
+            self.start_source_block(sequence, timestamp_us);
+        }
+        self.release_finished_block();
+        true
     }
 
     fn fill_packet(&mut self, stereo_frames: usize, output: &mut [u8]) {
@@ -129,24 +147,41 @@ impl PcmReader {
                     self.inserted_frames = self.inserted_frames.wrapping_add(1);
                     self.correction_cooldown_frames = PCM_CORRECTION_INTERVAL_FRAMES;
                 }
-            } else if buffered_blocks >= PCM_HIGH_WATERMARK_BLOCKS && self.next_source_frame().is_some() {
+            } else if buffered_blocks >= PCM_HIGH_WATERMARK_BLOCKS && self.discard_source_frame() {
                 self.discarded_frames = self.discarded_frames.wrapping_add(1);
                 self.correction_cooldown_frames = PCM_CORRECTION_INTERVAL_FRAMES;
             }
         }
 
-        while let Some(frame) = output_frames.next() {
-            let Some((left, right)) = self.next_source_frame() else {
+        while output_frames.len() != 0 {
+            self.release_finished_block();
+            let Some(block) = self.receiver.try_receive() else {
                 self.underflows = self.underflows.wrapping_add(1);
                 self.buffering = true;
                 defmt::warn!("PCM underflow; rebuffering, count={}", self.underflows);
-                frame.fill(0);
                 output_frames.for_each(|remaining| remaining.fill(0));
                 return;
             };
-            write_stereo_frame(frame, left, right);
-            self.last_frame = Some((left, right));
+            let block_metadata = (self.frame_index == 0).then_some((block.sequence, block.timestamp_us));
+
+            let copied_frames = output_frames.len().min(SAMPLES_PER_CHANNEL - self.frame_index);
+            let source_range = self.frame_index..self.frame_index + copied_frames;
+            let mut last_frame = None;
+            for (frame, (&left, &right)) in output_frames
+                .by_ref()
+                .take(copied_frames)
+                .zip(block.left[source_range.clone()].iter().zip(&block.right[source_range]))
+            {
+                write_stereo_frame(frame, left, right);
+                last_frame = Some((left, right));
+            }
+            self.frame_index += copied_frames;
+            self.last_frame = last_frame;
+            if let Some((sequence, timestamp_us)) = block_metadata {
+                self.start_source_block(sequence, timestamp_us);
+            }
         }
+        self.release_finished_block();
     }
 }
 
@@ -350,7 +385,7 @@ async fn usb_task(
                 let cadence_us = (now - cadence_started).as_micros();
                 cadence_started = now;
                 defmt::info!(
-                    "USB packets={} last_1000_packets_us={} sent_pcm_frames={} buffered_blocks={} underflows={} inserted_frames={} discarded_frames={} left_seq={} right_seq={} source_ts={}",
+                    "USB packets={} last_1000_packets_us={} sent_pcm_frames={} buffered_blocks={} underflows={} inserted_frames={} discarded_frames={} missing_source_blocks={} left_seq={} right_seq={} source_ts={}",
                     usb_frames,
                     cadence_us,
                     cadence_pcm_frames,
@@ -358,6 +393,7 @@ async fn usb_task(
                     pcm.underflows,
                     pcm.inserted_frames,
                     pcm.discarded_frames,
+                    pcm.missing_source_blocks,
                     pcm.last_left_sequence,
                     pcm.last_right_sequence,
                     pcm.last_timestamp_us
