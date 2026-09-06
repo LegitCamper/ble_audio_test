@@ -11,12 +11,16 @@
 use alloc::vec;
 
 use ble_audio_link::VolumeCommand;
-use bt_hci::cmd::le::{LeReadLocalSupportedFeatures, LeSetHostFeature};
+use bt_hci::cmd::le::{
+    LeClearAdvSets, LeReadLocalSupportedFeatures, LeReadNumberOfSupportedAdvSets, LeSetAdvSetRandomAddr,
+    LeSetExtAdvData, LeSetExtAdvParams, LeSetExtScanResponseData, LeSetHostFeature,
+};
 use bt_hci::controller::{ControllerCmdAsync, ControllerCmdSync};
 use defmt::Debug2Format;
-use embassy_futures::select::{Either, Either4, select, select4};
+use embassy_futures::select::{Either4, select4};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
-use embassy_time::{Duration, Timer};
+use embassy_sync::signal::Signal;
+use embassy_time::Duration;
 use heapless::Vec as HVec;
 use trouble_audio::cis::{self, CisManager};
 use trouble_audio::prelude::*;
@@ -32,6 +36,8 @@ const CONNECTIONS_MAX: usize = 1;
 const L2CAP_CHANNELS_MAX: usize = 3;
 /// Name advertised and exposed through the GAP Device Name characteristic.
 const DEVICE_NAME: &[u8] = b"Ble Audio Sink";
+/// CAP Targeted Announcement value used by Android's bonded LE Audio background scanner.
+const CAP_TARGETED_ANNOUNCEMENT: &[u8] = &[0x01];
 /// Volume this sink reports before a client sets one.
 ///
 /// Roughly half scale, so a freshly paired phone that renders before touching its slider is
@@ -40,10 +46,9 @@ const INITIAL_VOLUME: u8 = 128;
 /// Amount one relative Volume Control Point step moves the setting, giving 16 steps across the
 /// scale, which is close to what phone volume rockers expect.
 const VOLUME_STEP: u8 = 16;
-/// Time spent targeting a saved peer before returning to discoverable advertising.
-const DIRECTED_RECONNECT_TIMEOUT: Duration = Duration::from_secs(1);
-/// Idle time that lets the controller apply a queued resolving-list update before advertising.
-const RESOLVING_LIST_SETTLE_TIME: Duration = Duration::from_millis(100);
+/// Fast advertising intervals intended to overlap a phone's low-duty background scan quickly.
+const RECONNECT_ADV_INTERVAL_MIN: Duration = Duration::from_millis(30);
+const RECONNECT_ADV_INTERVAL_MAX: Duration = Duration::from_millis(60);
 
 /// Attribute backing store for every service this sink exposes.
 ///
@@ -72,7 +77,13 @@ where
         + for<'a> ControllerCmdSync<LeSetupIsoDataPath<'a>>
         + ControllerCmdSync<LeRemoveIsoDataPath>
         + ControllerCmdSync<LeSetHostFeature>
-        + ControllerCmdSync<LeReadLocalSupportedFeatures>,
+        + ControllerCmdSync<LeReadLocalSupportedFeatures>
+        + for<'a> ControllerCmdSync<LeSetExtAdvData<'a>>
+        + ControllerCmdSync<LeClearAdvSets>
+        + ControllerCmdSync<LeSetExtAdvParams>
+        + ControllerCmdSync<LeSetAdvSetRandomAddr>
+        + ControllerCmdSync<LeReadNumberOfSupportedAdvSets>
+        + for<'a> ControllerCmdSync<LeSetExtScanResponseData<'a>>,
 {
     let appearance = appearance::audio_sink::GENERIC_AUDIO_SINK;
     let sink_pac = PAC::new(&[PACRecord {
@@ -108,11 +119,21 @@ where
         // No display or keyboard on an audio sink: JustWorks pairing.
         .set_io_capabilities(IoCapabilities::NoInputNoOutput)
         .build();
-    let mut bonded_identity = bond_store.load().map(|bond| {
+    let mut bonded_identity = bond_store.load().and_then(|bond| {
         let identity = bond.identity;
-        let _ = stack.add_bond_information(bond);
-        defmt::info!("loaded saved peer for directed reconnect: {}", identity.addr);
-        identity
+        let is_bonded = bond.is_bonded;
+        if let Err(error) = stack.add_bond_information(bond) {
+            defmt::warn!("failed to restore saved bond: {}", Debug2Format(&error));
+            return None;
+        }
+        defmt::info!(
+            "loaded saved peer bond: {} kind={} irk={} bonded={}",
+            identity.addr,
+            identity.addr.kind.as_raw(),
+            identity.irk.is_some(),
+            is_bonded
+        );
+        Some(identity)
     });
     let mut runner = stack.runner();
     let mut peripheral = stack.peripheral();
@@ -121,7 +142,7 @@ where
     // call. VCS is deliberately left out of the advertised UUIDs, which stays byte-identical to
     // the advertisement this sink was brought up with; the list is already marked incomplete and
     // a client discovers Volume Control after connecting.
-    let mut advertiser_data = [0; 31];
+    let mut advertiser_data = [0; 64];
     let adv_data_len = AdStructure::encode_slice(
         &[
             AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
@@ -130,11 +151,18 @@ where
                 service::AUDIO_STREAM_CONTROL.to_le_bytes(),
                 service::COMMON_AUDIO.to_le_bytes(),
             ]),
+            // Android's LE Audio background scanner filters specifically for Common Audio
+            // Service Data beginning with the CAP Targeted Announcement value. A UUID-list entry
+            // alone is not enough to wake its automatic reconnect path.
+            AdStructure::ServiceData16 {
+                uuid: service::COMMON_AUDIO.to_le_bytes(),
+                data: CAP_TARGETED_ANNOUNCEMENT,
+            },
             AdStructure::CompleteLocalName(DEVICE_NAME),
         ],
         &mut advertiser_data[..],
     )
-    .expect("static advertising data always fits in 31 bytes");
+    .expect("static advertising data always fits in 64 bytes");
     let advertiser_data = &advertiser_data[..adv_data_len];
 
     let mut storage = SinkStorage::default();
@@ -163,6 +191,7 @@ where
         )
         .add_cis_manager(cis_manager)
         .build();
+    let host_ready = Signal::<NoopRawMutex, ()>::new();
 
     select4(
         async {
@@ -175,11 +204,16 @@ where
         cis::drive_cis(&stack, cis_manager),
         async {
             cis::enable_cis_host_support(&stack).await;
+            // This HCI operation waits for Trouble's host initialization. Advertising must not
+            // start before this point, or its resolving-list settle timer can expire while the
+            // controller is still starting up and make directed reconnects timing-dependent.
+            host_ready.signal(());
             core::future::pending::<()>().await
         },
         async {
+            host_ready.wait().await;
             loop {
-                let conn = match advertise(advertiser_data, bonded_identity, &mut peripheral, &server).await {
+                let conn = match advertise(advertiser_data, &mut peripheral, &server).await {
                     Ok(conn) => conn,
                     Err(error) => {
                         defmt::warn!("advertise error: {}", Debug2Format(&error));
@@ -190,7 +224,9 @@ where
                 // A connection is not bondable by default, and must be marked as such before
                 // pairing starts - otherwise `PairingComplete` always reports `bond: None` (a
                 // temporary key only), even if the peer requests bonding.
-                let _ = conn.raw().set_bondable(true);
+                if let Err(error) = conn.raw().set_bondable(true) {
+                    defmt::warn!("failed to make connection bondable: {}", Debug2Format(&error));
+                }
 
                 // Publish the current setting up front so the bridge starts from the same volume
                 // this server reports, rather than from whatever the DAC powered up at.
@@ -243,7 +279,9 @@ where
                             // to be updated with the peer's IRK - without it, a peer using a
                             // rotating private address can pair successfully and then never be
                             // recognized on its next reconnect.
-                            let _ = stack.add_bond_information(bond.clone());
+                            if let Err(error) = stack.add_bond_information(bond.clone()) {
+                                defmt::warn!("failed to register new bond: {}", Debug2Format(&error));
+                            }
                             bond_store.save(&bond);
                             bonded_identity = Some(bond.identity);
                         }
@@ -307,47 +345,55 @@ fn publish_volume(server: &Server<'_, MAX_ASES, CONNECTIONS_MAX, NoopRawMutex>, 
     });
 }
 
-async fn advertise<'values, 'server, C: Controller>(
+async fn advertise<'values, 'server, C>(
     adv_data: &[u8],
-    bonded_identity: Option<Identity>,
     peripheral: &mut Peripheral<'values, C, DefaultPacketPool>,
     server: &'server Server<'values, MAX_ASES, CONNECTIONS_MAX, NoopRawMutex>,
-) -> Result<GattConnection<'values, 'server, DefaultPacketPool>, BleHostError<C::Error>> {
-    if let Some(identity) = bonded_identity {
-        // Resolving-list changes are only applied while the controller is idle. In particular,
-        // this lets it learn a saved peer's IRK before targeting the peer's rotating address.
-        Timer::after(RESOLVING_LIST_SETTLE_TIME).await;
-        let peer = identity.addr;
-        let advertiser = peripheral
-            .advertise(
-                &Default::default(),
-                Advertisement::ConnectableNonscannableDirectedHighDuty { peer },
-            )
-            .await?;
-        defmt::info!("directed advertising to saved peer: {}", peer);
-        // Legacy advertising ignores AdvertisementParameters::timeout, so enforce a real
-        // wall-clock deadline. Dropping `accept` cancels directed advertising before the normal,
-        // scannable advertisement below is started.
-        match select(advertiser.accept(), Timer::after(DIRECTED_RECONNECT_TIMEOUT)).await {
-            Either::First(Ok(conn)) => return Ok(conn.with_attribute_server(&server.server)?),
-            Either::First(Err(error)) => {
-                defmt::warn!("directed advertising failed: {}", Debug2Format(&error));
-            }
-            Either::Second(()) => defmt::info!("saved peer did not reconnect; advertising to all peers"),
-        }
-    }
-
-    let advertiser = peripheral
-        .advertise(
-            &Default::default(),
-            Advertisement::ConnectableScannableUndirected {
-                adv_data,
-                scan_data: &[],
-            },
-        )
-        .await?;
-    defmt::info!("advertising");
+) -> Result<GattConnection<'values, 'server, DefaultPacketPool>, BleHostError<C::Error>>
+where
+    C: Controller
+        + for<'a> ControllerCmdSync<LeSetExtAdvData<'a>>
+        + ControllerCmdSync<LeClearAdvSets>
+        + ControllerCmdSync<LeSetExtAdvParams>
+        + ControllerCmdSync<LeSetAdvSetRandomAddr>
+        + ControllerCmdSync<LeReadNumberOfSupportedAdvSets>
+        + for<'a> ControllerCmdSync<LeSetExtScanResponseData<'a>>,
+{
+    // Bluetooth controllers do not allow the legacy and extended advertising command families
+    // to be mixed until an HCI reset. Keep this advertisement extended for its whole lifetime;
+    // Android's LE Audio background scanner also explicitly rejects legacy advertisements.
+    let params = AdvertisementParameters {
+        interval_min: RECONNECT_ADV_INTERVAL_MIN,
+        interval_max: RECONNECT_ADV_INTERVAL_MAX,
+        ..Default::default()
+    };
+    let advertiser = start_cap_advertising(adv_data, params, peripheral).await?;
+    defmt::info!("extended CAP targeted advertising to all peers");
     // `?` converts the attribute-server error into `BleHostError`; returning it directly would not.
     let conn = advertiser.accept().await?.with_attribute_server(&server.server)?;
     Ok(conn)
+}
+
+/// Starts the extended CAP advertisement Android uses to find disconnected bonded audio servers.
+async fn start_cap_advertising<'values, C>(
+    adv_data: &[u8],
+    params: AdvertisementParameters,
+    peripheral: &mut Peripheral<'values, C, DefaultPacketPool>,
+) -> Result<Advertiser<'values, C, DefaultPacketPool>, BleHostError<C::Error>>
+where
+    C: Controller
+        + for<'a> ControllerCmdSync<LeSetExtAdvData<'a>>
+        + ControllerCmdSync<LeClearAdvSets>
+        + ControllerCmdSync<LeSetExtAdvParams>
+        + ControllerCmdSync<LeSetAdvSetRandomAddr>
+        + ControllerCmdSync<LeReadNumberOfSupportedAdvSets>
+        + for<'a> ControllerCmdSync<LeSetExtScanResponseData<'a>>,
+{
+    let sets = [AdvertisementSet {
+        params,
+        data: Advertisement::ExtConnectableNonscannableUndirected { adv_data },
+        address: None,
+    }];
+    let mut handles = AdvertisementSet::handles(&sets);
+    peripheral.advertise_ext(&sets, &mut handles).await
 }

@@ -89,12 +89,14 @@ forwarded to the RP2350 as a kind-3 serial frame, so the value that crosses the 
 profile state machine settled on, including its clamping of relative steps. Mute travels separately
 from the level, because unmuting has to restore the previous level rather than zero.
 
-The nRF persists the latest bond in RRAM. On boot and after a disconnect it first sends a
-high-duty directed advertisement to that saved peer for one second, then a hard timer cancels it
-and starts normal discoverable, scannable advertising so a different source can connect. If the
-saved peer has used "Forget This Device", its next pairing request clears the stale runtime and
-RRAM bond before saving the replacement. The peripheral cannot initiate a BLE link, but directed
-advertising gives the saved phone a fast, targeted reconnect opportunity.
+The nRF persists the latest bond in RRAM. On boot and after a disconnect it continuously sends a
+connectable extended CAP Targeted Announcement at a fast 30–60 ms interval. Android's bonded LE
+Audio background scanner explicitly filters for that non-legacy Common Audio Service Data;
+advertising only the service UUID does not trigger it. The advertisement starts only after the
+controller is initialized and stays available while the phone's background scanner decides to
+connect. If the saved peer has used "Forget This Device", its next pairing request clears the stale
+runtime and RRAM bond before saving the replacement. The peripheral cannot initiate a BLE link;
+the targeted announcement is what wakes the saved phone's automatic reconnect path.
 
 On the USB side, volume has exactly one owner, chosen once at configure time. If the
 device exposes a feature unit fed by this stream that claims a writable volume control, the host

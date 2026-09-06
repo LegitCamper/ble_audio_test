@@ -31,7 +31,7 @@ postcard = "1"
 static_cell = "2"
 trouble-audio = { git = "https://github.com/LegitCamper/trouble_audio", rev = "2abf9f1512cd02a478aa719c85d82816ac0ec599", package = "trouble_audio", default-features = false, features = ["defmt", "nrf-sdc"] }
 trouble-audio-example-apps = { git = "https://github.com/LegitCamper/trouble_audio", rev = "2abf9f1512cd02a478aa719c85d82816ac0ec599", features = ["defmt"] }
-trouble-host = { git = "https://github.com/LegitCamper/trouble", branch = "fix/iso-disconnection-events", features = ["derive", "scan", "gatt", "central", "security", "iso", "default-packet-pool"] }
+trouble-host = { git = "https://github.com/LegitCamper/trouble", branch = "fix/iso-disconnection-events", features = ["derive", "scan", "gatt", "central", "security", "iso", "default-packet-pool", "extended-advertising"] }
 
 [lints.rust]
 future-incompatible = "warn"
