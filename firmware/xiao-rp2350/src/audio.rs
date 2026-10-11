@@ -13,7 +13,7 @@ use embedded_io_async::Read;
 use lc3_codec::common::complex::{Complex, Scaler};
 use lc3_codec::common::config::{FrameDuration as CodecFrameDuration, SamplingFrequency};
 use lc3_codec::decoder::lc3_decoder::Lc3Decoder;
-use portable_atomic::{AtomicU8, AtomicU16};
+use portable_atomic::{AtomicU16, AtomicU32};
 use static_cell::StaticCell;
 
 /// Sample rate of the received LC3 streams and decoded PCM.
@@ -31,48 +31,19 @@ const CODEC_SAMPLE_RATE: SamplingFrequency = SamplingFrequency::Hz48000;
 const DECODER_BUFFER_LENGTHS: (usize, usize) =
     Lc3Decoder::<DECODER_CHANNELS>::calc_working_buffer_lengths(CODEC_FRAME_DURATION, CODEC_SAMPLE_RATE);
 
-static AUDIO_PROGRESS: AtomicU8 = AtomicU8::new(AudioProgress::WaitingForUart as u8);
 /// Latest volume published by core 1 for core 0 to apply, or [`NO_VOLUME`] if the source has not
 /// sent one. Packing it into a single word keeps level and mute inseparable across cores, so the
 /// USB task can never observe a new level with a stale mute.
 static VOLUME: AtomicU16 = AtomicU16::new(NO_VOLUME);
+static UART_BYTES: AtomicU32 = AtomicU32::new(0);
+static LC3_WIRE_FRAMES: AtomicU32 = AtomicU32::new(0);
+static STEREO_PAIRS: AtomicU32 = AtomicU32::new(0);
+static DECODED_BLOCKS: AtomicU32 = AtomicU32::new(0);
 /// Sentinel meaning no volume has been received; distinguishable from level 0 with mute clear.
 const NO_VOLUME: u16 = 0xffff;
 const VOLUME_MUTED_BIT: u16 = 1 << 8;
 static DECODER_SCALER_MEMORY: StaticCell<[Scaler; DECODER_BUFFER_LENGTHS.0]> = StaticCell::new();
 static DECODER_COMPLEX_MEMORY: StaticCell<[Complex; DECODER_BUFFER_LENGTHS.1]> = StaticCell::new();
-
-/// Furthest audio-pipeline stage reached since boot.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum AudioProgress {
-    /// No UART bytes have arrived.
-    WaitingForUart = 0,
-    /// UART bytes arrived, but no complete valid link frame was parsed.
-    UartBytes = 1,
-    /// A valid framed audio packet was parsed.
-    WireFrame = 2,
-    /// A matching LC3 stereo pair was decoded.
-    Lc3Decoded = 3,
-    /// A decoded stereo block was published to USB.
-    StereoQueued = 4,
-}
-
-/// Returns the furthest audio-pipeline stage reached since boot.
-#[must_use]
-pub fn progress() -> AudioProgress {
-    match AUDIO_PROGRESS.load(Ordering::Relaxed) {
-        1 => AudioProgress::UartBytes,
-        2 => AudioProgress::WireFrame,
-        3 => AudioProgress::Lc3Decoded,
-        4 => AudioProgress::StereoQueued,
-        _ => AudioProgress::WaitingForUart,
-    }
-}
-
-fn mark_progress(progress: AudioProgress) {
-    AUDIO_PROGRESS.fetch_max(progress as u8, Ordering::Relaxed);
-}
 
 /// Publishes a volume received from the LE Audio source for the USB task to apply.
 fn publish_volume(command: VolumeCommand) {
@@ -90,6 +61,30 @@ pub fn latest_volume() -> Option<VolumeCommand> {
         level: packed as u8,
         muted: packed & VOLUME_MUTED_BIT != 0,
     })
+}
+
+/// Monotonic core-1 pipeline counters for hardware-visible starvation diagnosis.
+#[derive(Clone, Copy)]
+pub struct PipelineCounters {
+    /// UART bytes accepted by the parser task.
+    pub uart_bytes: u32,
+    /// Valid LC3 wire frames accepted by the decoder pipeline.
+    pub lc3_wire_frames: u32,
+    /// Matching left/right LC3 frame pairs assembled.
+    pub stereo_pairs: u32,
+    /// Stereo PCM blocks successfully decoded and queued.
+    pub decoded_blocks: u32,
+}
+
+/// Returns a coherent-enough diagnostic snapshot; each counter only increases.
+#[must_use]
+pub fn pipeline_counters() -> PipelineCounters {
+    PipelineCounters {
+        uart_bytes: UART_BYTES.load(Ordering::Relaxed),
+        lc3_wire_frames: LC3_WIRE_FRAMES.load(Ordering::Relaxed),
+        stereo_pairs: STEREO_PAIRS.load(Ordering::Relaxed),
+        decoded_blocks: DECODED_BLOCKS.load(Ordering::Relaxed),
+    }
 }
 
 /// One 10 ms block of signed stereo PCM stored as decoder-native channel planes.
@@ -211,10 +206,7 @@ pub async fn run(mut uart: BufferedUartRx, mut pcm: PcmSender) -> ! {
                 continue;
             }
         };
-        if received != 0 {
-            mark_progress(AudioProgress::UartBytes);
-        }
-
+        UART_BYTES.fetch_add(received as u32, Ordering::Relaxed);
         for &byte in &rx_buffer[..received] {
             let frame = match parser.push(byte) {
                 Ok(Some(frame)) => frame,
@@ -224,8 +216,6 @@ pub async fn run(mut uart: BufferedUartRx, mut pcm: PcmSender) -> ! {
                     continue;
                 }
             };
-            mark_progress(AudioProgress::WireFrame);
-
             if frame.meta.encoding == AudioEncoding::Volume {
                 match VolumeCommand::from_payload(frame.payload()) {
                     Some(command) => {
@@ -251,10 +241,12 @@ pub async fn run(mut uart: BufferedUartRx, mut pcm: PcmSender) -> ! {
                 );
                 continue;
             }
+            LC3_WIRE_FRAMES.fetch_add(1, Ordering::Relaxed);
 
             let Some((left, right)) = pairer.push(frame) else {
                 continue;
             };
+            STEREO_PAIRS.fetch_add(1, Ordering::Relaxed);
             let sequence = left.meta.sequence;
             // A sender-declared discontinuity means the gap is intentional, so inferring missing
             // blocks from it would generate PLC for audio that was never sent.
@@ -299,10 +291,10 @@ pub async fn run(mut uart: BufferedUartRx, mut pcm: PcmSender) -> ! {
                 block.sequence = concealed_sequence;
                 block.timestamp_us = concealed_timestamp_us;
                 pcm.send_done();
+                DECODED_BLOCKS.fetch_add(1, Ordering::Relaxed);
                 last_decoded_sequence = Some(concealed_sequence);
                 last_decoded_timestamp_us = concealed_timestamp_us;
                 concealed_blocks = concealed_blocks.wrapping_add(1);
-                mark_progress(AudioProgress::StereoQueued);
             }
 
             let Some(block) = pcm.try_send() else {
@@ -329,11 +321,10 @@ pub async fn run(mut uart: BufferedUartRx, mut pcm: PcmSender) -> ! {
             block.sequence = left.meta.sequence;
             block.timestamp_us = left.meta.timestamp_us;
             pcm.send_done();
+            DECODED_BLOCKS.fetch_add(1, Ordering::Relaxed);
             last_decoded_sequence = Some(sequence);
             last_decoded_timestamp_us = left.meta.timestamp_us;
 
-            mark_progress(AudioProgress::Lc3Decoded);
-            mark_progress(AudioProgress::StereoQueued);
             stereo_blocks = stereo_blocks.wrapping_add(1);
 
             if stereo_blocks % 100 == 0 {

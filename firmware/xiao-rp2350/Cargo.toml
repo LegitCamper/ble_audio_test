@@ -50,6 +50,7 @@ embedded-io-async = "0.7"
 lc3-codec = { path = "../../crates/lc3-codec", default-features = false }
 panic-probe = { version = "1", features = ["print-defmt"] }
 portable-atomic = { version = "1", features = ["critical-section"] }
+smart-leds = "0.4"
 static_cell = "2"
 
 [lints.rust]
