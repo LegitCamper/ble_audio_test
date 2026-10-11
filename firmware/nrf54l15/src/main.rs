@@ -11,7 +11,7 @@ mod watchdog;
 
 use core::cell::RefCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 
 use ble_audio_link::{
     AudioEncoding, Channel, FrameDuration as LinkFrameDuration, FrameFlags, FrameMeta, VolumeCommand, encode,
@@ -211,6 +211,8 @@ static LC3_TX_QUEUE: AsyncChannel<CriticalSectionRawMutex, StereoLc3Pair, 4> = A
 /// frame, so a volume change neither displaces queued audio nor costs a full wire-frame buffer.
 static VOLUME_TX_QUEUE: AsyncChannel<CriticalSectionRawMutex, VolumeCommand, 2> = AsyncChannel::new();
 static LATEST_VOLUME: AtomicU16 = AtomicU16::new(0xffff);
+static TRANSMITTED_PAIRS: AtomicU32 = AtomicU32::new(0);
+static UART_FAULT: AtomicBool = AtomicBool::new(false);
 static UART_EXECUTOR: InterruptExecutor = InterruptExecutor::new();
 
 #[interrupt]
@@ -265,8 +267,33 @@ fn channel_from_allocation(allocation: Option<AudioLocation>) -> Option<Channel>
 }
 
 #[embassy_executor::task]
+async fn status_led_task(mut led: Output<'static>) -> ! {
+    let mut last_transmitted_pairs = 0_u32;
+    let mut pulse_on = false;
+    loop {
+        if UART_FAULT.load(Ordering::Relaxed) {
+            led.set_low();
+        } else {
+            let transmitted_pairs = TRANSMITTED_PAIRS.load(Ordering::Relaxed);
+            if transmitted_pairs != last_transmitted_pairs {
+                last_transmitted_pairs = transmitted_pairs;
+                pulse_on = !pulse_on;
+                if pulse_on {
+                    led.set_low();
+                } else {
+                    led.set_high();
+                }
+            } else {
+                pulse_on = false;
+                led.set_high();
+            }
+        }
+        Timer::after_millis(100).await;
+    }
+}
+
+#[embassy_executor::task]
 async fn uart_tx_task(mut uart: UarteTx<'static>, mut watchdog: WatchdogHandle) -> ! {
-    let mut transmitted_pairs = 0_u32;
     let mut volume_sequence = 0_u16;
     loop {
         // Neither branch consumes its item until it is selected, so losing the race cannot drop a
@@ -284,10 +311,12 @@ async fn uart_tx_task(mut uart: UarteTx<'static>, mut watchdog: WatchdogHandle) 
                     flags: pair.flags,
                 };
                 let Ok(encoded) = encode(left_meta, &pair.left) else {
+                    UART_FAULT.store(true, Ordering::Relaxed);
                     defmt::warn!("left LC3 frame exceeded link capacity");
                     continue;
                 };
                 if uart.write(encoded.as_bytes()).await.is_err() {
+                    UART_FAULT.store(true, Ordering::Relaxed);
                     defmt::warn!("stereo LC3 UART write failed");
                     continue;
                 }
@@ -298,14 +327,16 @@ async fn uart_tx_task(mut uart: UarteTx<'static>, mut watchdog: WatchdogHandle) 
                     ..left_meta
                 };
                 let Ok(encoded) = encode(right_meta, &pair.right) else {
+                    UART_FAULT.store(true, Ordering::Relaxed);
                     defmt::warn!("right LC3 frame exceeded link capacity");
                     continue;
                 };
                 if uart.write(encoded.as_bytes()).await.is_err() {
+                    UART_FAULT.store(true, Ordering::Relaxed);
                     defmt::warn!("stereo LC3 UART write failed");
                     continue;
                 }
-                transmitted_pairs = transmitted_pairs.wrapping_add(1);
+                let transmitted_pairs = TRANSMITTED_PAIRS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
                 if transmitted_pairs == 1 || transmitted_pairs % 200 == 0 {
                     defmt::info!("transmitted LC3 stereo pairs={}", transmitted_pairs);
                 }
@@ -339,7 +370,6 @@ async fn uart_tx_task(mut uart: UarteTx<'static>, mut watchdog: WatchdogHandle) 
 }
 
 async fn forward_lc3(
-    led: &mut Output<'static>,
     cis_manager: &CisManager<NoopRawMutex, { basic_audio_sink::MAX_ASES }>,
     mut watchdog: WatchdogHandle,
 ) -> ! {
@@ -407,6 +437,7 @@ async fn forward_lc3(
         if LC3_TX_QUEUE.try_send(pair).is_err() {
             dropped_pairs = dropped_pairs.wrapping_add(1);
             queue_overflowed = true;
+            UART_FAULT.store(true, Ordering::Relaxed);
         } else {
             started = true;
             queue_overflowed = false;
@@ -415,9 +446,6 @@ async fn forward_lc3(
         last_sequence = Some(sequence);
         last_timestamp_us = timestamp_us;
         stereo_pairs = stereo_pairs.wrapping_add(1);
-        if stereo_pairs % 40 == 0 {
-            led.toggle();
-        }
         if stereo_pairs % 200 == 0 {
             let now = Instant::now();
             let report_us = (now - report_started).as_micros();
@@ -471,8 +499,7 @@ async fn main(spawner: Spawner) {
         reset_reason.0
     );
 
-    static LED: StaticCell<Output> = StaticCell::new();
-    let led = LED.init(Output::new(p.P0_02, Level::Low, OutputDrive::Standard));
+    let led = Output::new(p.P0_02, Level::High, OutputDrive::Standard);
 
     let mpsl_peripherals = mpsl::Peripherals::new(
         p.GRTC_CH7,
@@ -543,9 +570,10 @@ async fn main(spawner: Spawner) {
     let uart_spawner = UART_EXECUTOR.start(interrupt::SWI01);
     uart_spawner.spawn(unwrap!(uart_tx_task(uart, uart_watchdog)));
     spawner.spawn(unwrap!(volume_replay_task()));
+    spawner.spawn(unwrap!(status_led_task(led)));
 
     let _ = select(
-        forward_lc3(led, cis_manager, main_watchdog),
+        forward_lc3(cis_manager, main_watchdog),
         audio_sink::run(sdc, cis_manager, &bond_store),
     )
     .await;

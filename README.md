@@ -39,8 +39,19 @@ USB control transfers, SOF waits, decoding, and UART writes cannot feed through 
 Watchdogs run during normal sleep and pause when a debugger halts a core. RTT logging
 is forced nonblocking so a disconnected logging session cannot freeze the firmware.
 
-The XIAO yellow LED flashes **once on normal startup, three times after a watchdog
-timeout**, then returns to its playback indication. Watchdog scratch registers retain
+The XIAO onboard RGB LED provides status through PIO on GPIO22, with GPIO23 enabling
+its power. It stays off during normal startup, DAC wait, and the initial six-block
+prebuffer; shows **green** while PCM playback recently contained nonzero samples; shows
+**cyan** after two seconds of continuous decoded digital silence; and shows **purple** while
+PCM exists but output is held silent because volume has not applied. During rebuffering it
+shows **blue** when UART bytes stop, **orange** when UART bytes arrive without valid LC3
+frames, **pink** when valid LC3 frames fail stereo pairing or decoding, and **yellow** when
+decoded blocks still arrive but too slowly to sustain playback. After a watchdog timeout,
+it shows **red for one second** on the next boot. The separate active-low yellow LED on
+GPIO25 remains disabled. On the nRF54L15 DK, the green LED blinks only while complete
+stereo pairs are successfully written to UART, turns off when successful UART traffic
+stops, and stays solid after a TX queue overflow, frame encoding failure, or UART write
+failure. This separates BLE reception from delivery toward the XIAO. Watchdog scratch registers retain
 a timeout count and the last missing-task mask for RTT diagnostics; these are not a
 power-loss-persistent crash log. The nRF logs and clears its hardware reset-reason bits.
 After an XIAO reset or DAC reconnect, packets remain silent until volume is applied.
