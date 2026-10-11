@@ -256,7 +256,10 @@ pub async fn run(mut uart: BufferedUartRx, mut pcm: PcmSender) -> ! {
                 continue;
             };
             let sequence = left.meta.sequence;
-            let starts_stream = left.meta.flags.contains(FrameFlags::STREAM_START);
+            // A sender-declared discontinuity means the gap is intentional, so inferring missing
+            // blocks from it would generate PLC for audio that was never sent.
+            let starts_stream = left.meta.flags.contains(FrameFlags::STREAM_START)
+                || left.meta.flags.contains(FrameFlags::DISCONTINUITY);
             let missing_blocks = if starts_stream {
                 0
             } else {
@@ -265,7 +268,11 @@ pub async fn run(mut uart: BufferedUartRx, mut pcm: PcmSender) -> ! {
                     if distance < 0x8000 { distance } else { 0 }
                 })
             };
-            let conceal_blocks = missing_blocks.min(MAX_CONCEALED_BLOCKS_PER_GAP);
+            // Only the consumer frees slots, so this snapshot can only grow stale in the safe
+            // direction. Reserving one keeps room for the real frame decoded below.
+            let free_plc_slots =
+                u16::try_from((PCM_RING_CAPACITY - pcm.len()).saturating_sub(1)).unwrap_or(u16::MAX);
+            let conceal_blocks = missing_blocks.min(MAX_CONCEALED_BLOCKS_PER_GAP).min(free_plc_slots);
             unconcealed_blocks = unconcealed_blocks.wrapping_add(u32::from(missing_blocks - conceal_blocks));
             let concealment_base_sequence = last_decoded_sequence.unwrap_or(sequence.wrapping_sub(missing_blocks + 1));
             let concealment_base_timestamp_us = last_decoded_timestamp_us;

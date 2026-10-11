@@ -39,6 +39,7 @@ struct LongTermPostFilterBufferLengths {
     pub scratch: usize,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum Transition {
     /// First case: inactive -> inactive
     Inactive,
@@ -328,8 +329,11 @@ impl<'a> LongTermPostFilter<'a> {
             }
         }
 
-        // copy to output
-        freq_samples.copy_from_slice(&self.x_hat_ltpf_mem[blk_start..(blk_start + nf)]);
+        // copy to output, except when the filter is inactive: that branch copied the untouched
+        // input into x_hat_ltpf_mem, so freq_samples already holds exactly these samples
+        if transition != Transition::Inactive {
+            freq_samples.copy_from_slice(&self.x_hat_ltpf_mem[blk_start..(blk_start + nf)]);
+        }
 
         // increment current block in block ring bufffer
         self.block_start_index += nf;

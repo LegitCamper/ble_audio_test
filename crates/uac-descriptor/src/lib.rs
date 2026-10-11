@@ -240,7 +240,14 @@ fn playback_from_interface(
     let terminal_link = compatible_stream_format(version, interface_body)?;
 
     let output = find_endpoint(interface_body, false, ENDPOINT_DATA)?;
-    if output.interval != 1 || usize::from(output.max_packet_size) < MINIMUM_PACKET_BYTES {
+    // An asynchronous sink's feedback can ask for one extra frame per packet, so its endpoint
+    // must have room for 49 frames; adaptive and synchronous sinks stay at the nominal 48.
+    let required_packet_bytes = if output.is_asynchronous() {
+        MINIMUM_PACKET_BYTES + BYTES_PER_FRAME
+    } else {
+        MINIMUM_PACKET_BYTES
+    };
+    if output.interval != 1 || usize::from(output.max_packet_size) < required_packet_bytes {
         return None;
     }
     let feedback = find_endpoint(interface_body, true, ENDPOINT_FEEDBACK).filter(|endpoint| {
@@ -779,11 +786,30 @@ mod tests {
 
     #[test]
     fn accepts_three_byte_full_speed_feedback_endpoint() {
-        let mut descriptors = uac1_alternate(&[11, 0x24, 2, 1, 2, 2, 16, 1, 0x80, 0xbb, 0x00], 0x05, 192);
+        let mut descriptors = uac1_alternate(&[11, 0x24, 2, 1, 2, 2, 16, 1, 0x80, 0xbb, 0x00], 0x05, 196);
         descriptors.extend_from_slice(&[9, 5, 0x81, 0x11, 3, 0, 1, 0, 0]);
 
         let selected = find_playback(&descriptors).expect("asynchronous alternate with 10.14 feedback");
         assert_eq!(selected.feedback.map(|endpoint| endpoint.max_packet_size), Some(3));
+    }
+
+    #[test]
+    fn rejects_asynchronous_output_without_room_for_a_feedback_adjusted_packet() {
+        let mut descriptors = uac1_alternate(&[11, 0x24, 2, 1, 2, 2, 16, 1, 0x80, 0xbb, 0x00], 0x05, 195);
+        descriptors.extend_from_slice(&[9, 5, 0x81, 0x11, 3, 0, 1, 0, 0]);
+
+        assert_eq!(find_playback(&descriptors), None);
+    }
+
+    #[test]
+    fn accepts_asynchronous_output_with_exactly_one_extra_frame_of_room() {
+        let mut descriptors = uac1_alternate(&[11, 0x24, 2, 1, 2, 2, 16, 1, 0x80, 0xbb, 0x00], 0x05, 196);
+        descriptors.extend_from_slice(&[9, 5, 0x81, 0x11, 3, 0, 1, 0, 0]);
+
+        assert_eq!(
+            find_playback(&descriptors).map(|config| config.output.max_packet_size),
+            Some(196)
+        );
     }
 
     #[test]

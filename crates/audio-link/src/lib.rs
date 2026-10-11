@@ -224,20 +224,6 @@ impl VolumeCommand {
     }
 }
 
-/// One COBS-encoded frame ready to write to a UART, including the zero delimiter.
-pub struct EncodedFrame {
-    bytes: [u8; MAX_WIRE_FRAME_BYTES],
-    len: usize,
-}
-
-impl EncodedFrame {
-    /// Returns the exact bytes to transmit.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..self.len]
-    }
-}
-
 /// Failure while constructing a wire frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EncodeError {
@@ -359,12 +345,16 @@ impl fmt::Display for DecodeError {
     }
 }
 
-/// Encodes one audio frame into a self-contained UART packet.
+/// Encodes one audio frame into caller-owned UART storage and returns the exact bytes to transmit.
 ///
 /// # Errors
 ///
 /// Returns [`EncodeError::PayloadTooLong`] when `payload` is larger than the protocol limit.
-pub fn encode(meta: FrameMeta, payload: &[u8]) -> Result<EncodedFrame, EncodeError> {
+pub fn encode_into<'a>(
+    meta: FrameMeta,
+    payload: &[u8],
+    output: &'a mut [u8; MAX_WIRE_FRAME_BYTES],
+) -> Result<&'a [u8], EncodeError> {
     let payload_limit = match meta.encoding {
         AudioEncoding::Lc3 => MAX_LC3_FRAME_BYTES,
         AudioEncoding::PcmS12LeMono => PCM_S12_MONO_FRAME_BYTES,
@@ -392,13 +382,9 @@ pub fn encode(meta: FrameMeta, payload: &[u8]) -> Result<EncodedFrame, EncodeErr
     let crc = crc16_ccitt_false(&raw[..body_len]);
     raw[body_len..body_len + CRC_BYTES].copy_from_slice(&crc.to_le_bytes());
 
-    let mut bytes = [0_u8; MAX_WIRE_FRAME_BYTES];
-    let encoded_len = cobs_encode(&raw[..body_len + CRC_BYTES], &mut bytes);
-    bytes[encoded_len] = 0;
-    Ok(EncodedFrame {
-        bytes,
-        len: encoded_len + 1,
-    })
+    let encoded_len = cobs_encode(&raw[..body_len + CRC_BYTES], output);
+    output[encoded_len] = 0;
+    Ok(&output[..=encoded_len])
 }
 
 /// Incremental decoder for a UART byte stream.
@@ -610,10 +596,11 @@ mod tests {
     #[test]
     fn stream_decoder_should_round_trip_payload_containing_zeroes() {
         let payload = [0, 1, 0, 2, 3, 0, 4];
-        let encoded = encode(example_meta(), &payload).expect("test frame must encode");
+        let mut output = [0_u8; MAX_WIRE_FRAME_BYTES];
+        let encoded = encode_into(example_meta(), &payload, &mut output).expect("test frame must encode");
         let mut parser = StreamDecoder::new();
         let mut completed_frame = None;
-        for &byte in encoded.as_bytes() {
+        for &byte in encoded {
             completed_frame = parser.push(byte).expect("test frame must decode").or(completed_frame);
         }
 
@@ -626,11 +613,14 @@ mod tests {
 
     #[test]
     fn stream_decoder_should_reject_a_corrupt_body() {
-        let mut encoded = encode(example_meta(), &[1, 2, 3, 4]).expect("test frame must encode");
-        encoded.bytes[5] ^= 0x40;
+        let mut output = [0_u8; MAX_WIRE_FRAME_BYTES];
+        let encoded_len = encode_into(example_meta(), &[1, 2, 3, 4], &mut output)
+            .expect("test frame must encode")
+            .len();
+        output[5] ^= 0x40;
         let mut parser = StreamDecoder::new();
         let mut result = Ok(None);
-        for &byte in encoded.as_bytes() {
+        for &byte in &output[..encoded_len] {
             result = parser.push(byte);
         }
 
@@ -645,9 +635,10 @@ mod tests {
         }
         assert_eq!(parser.push(0), Err(DecodeError::FrameTooLong));
 
-        let encoded = encode(example_meta(), &[9, 8, 7]).expect("test frame must encode");
+        let mut output = [0_u8; MAX_WIRE_FRAME_BYTES];
+        let encoded = encode_into(example_meta(), &[9, 8, 7], &mut output).expect("test frame must encode");
         let mut completed_frame = None;
-        for &byte in encoded.as_bytes() {
+        for &byte in encoded {
             completed_frame = parser.push(byte).expect("next frame must decode").or(completed_frame);
         }
         assert_eq!(completed_frame.expect("frame expected").payload(), &[9, 8, 7]);
@@ -664,11 +655,12 @@ mod tests {
             ..example_meta()
         };
 
-        let encoded = encode(meta, &command.to_payload()).expect("volume payload fits");
+        let mut output = [0_u8; MAX_WIRE_FRAME_BYTES];
+        let encoded = encode_into(meta, &command.to_payload(), &mut output).expect("volume payload fits");
         let mut parser = StreamDecoder::new();
         let mut decoded = None;
-        for byte in encoded.as_bytes() {
-            if let Ok(Some(frame)) = parser.push(*byte) {
+        for &byte in encoded {
+            if let Ok(Some(frame)) = parser.push(byte) {
                 decoded = Some(frame);
             }
         }
@@ -713,8 +705,9 @@ mod tests {
             ..example_meta()
         };
 
+        let mut output = [0_u8; MAX_WIRE_FRAME_BYTES];
         assert_eq!(
-            encode(meta, &[0; VOLUME_FRAME_BYTES + 1]).err(),
+            encode_into(meta, &[0; VOLUME_FRAME_BYTES + 1], &mut output).err(),
             Some(EncodeError::PayloadTooLong(VOLUME_FRAME_BYTES + 1))
         );
     }
@@ -722,8 +715,9 @@ mod tests {
     #[test]
     fn encode_should_reject_a_payload_over_the_limit() {
         let payload = [0_u8; MAX_LC3_FRAME_BYTES + 1];
+        let mut output = [0_u8; MAX_WIRE_FRAME_BYTES];
         assert_eq!(
-            encode(example_meta(), &payload).err(),
+            encode_into(example_meta(), &payload, &mut output).err(),
             Some(EncodeError::PayloadTooLong(payload.len()))
         );
     }
@@ -737,16 +731,41 @@ mod tests {
             *byte = u8::try_from(index % 256).expect("remainder fits in u8");
         }
 
-        let encoded = encode(meta, &payload).expect("PCM frame must encode");
+        let mut output = [0_u8; MAX_WIRE_FRAME_BYTES];
+        let encoded = encode_into(meta, &payload, &mut output).expect("PCM frame must encode");
         let mut parser = StreamDecoder::new();
         let mut completed_frame = None;
-        for &byte in encoded.as_bytes() {
+        for &byte in encoded {
             completed_frame = parser.push(byte).expect("PCM frame must decode").or(completed_frame);
         }
 
         let completed_frame = completed_frame.expect("delimiter must complete the PCM frame");
         assert_eq!(completed_frame.meta, meta);
         assert_eq!(completed_frame.payload(), payload);
+    }
+
+    #[test]
+    fn encode_into_should_let_one_buffer_serve_consecutive_frames() {
+        let mut output = [0_u8; MAX_WIRE_FRAME_BYTES];
+        let mut parser = StreamDecoder::new();
+        let mut sequences = [0_u16; 2];
+        let mut decoded = 0_usize;
+
+        for sequence in [7_u16, 8] {
+            let meta = FrameMeta {
+                sequence,
+                ..example_meta()
+            };
+            let encoded = encode_into(meta, &[0xa5; MAX_LC3_FRAME_BYTES], &mut output).expect("frame must encode");
+            for &byte in encoded {
+                if let Ok(Some(frame)) = parser.push(byte) {
+                    sequences[decoded] = frame.meta.sequence;
+                    decoded += 1;
+                }
+            }
+        }
+
+        assert_eq!(sequences, [7, 8]);
     }
 
     #[test]

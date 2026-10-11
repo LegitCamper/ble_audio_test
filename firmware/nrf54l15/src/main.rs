@@ -14,7 +14,8 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU16, Ordering};
 
 use ble_audio_link::{
-    AudioEncoding, Channel, FrameDuration as LinkFrameDuration, FrameFlags, FrameMeta, VolumeCommand, encode,
+    AudioEncoding, Channel, FrameDuration as LinkFrameDuration, FrameFlags, FrameMeta, MAX_LC3_FRAME_BYTES,
+    MAX_WIRE_FRAME_BYTES, VolumeCommand, encode_into,
 };
 use defmt::unwrap;
 use embassy_executor::{InterruptExecutor, Spawner};
@@ -83,7 +84,9 @@ fn build_sdc<'d, const N: usize>(
         )?
         .cig_count(1)?
         .cis_count(2)?
-        .iso_buffer_cfg(4, 128, 4, 6, 8, 128)?
+        // Receive SDUs must hold a full 155-byte LC3 frame; the default 128 would truncate the
+        // largest advertised configuration. TX stays small because this device is sink-only.
+        .iso_buffer_cfg(4, 128, 4, 6, 8, MAX_LC3_FRAME_BYTES as u16)?
         .build(peripherals, rng, mpsl, memory)
 }
 
@@ -268,6 +271,9 @@ fn channel_from_allocation(allocation: Option<AudioLocation>) -> Option<Channel>
 async fn uart_tx_task(mut uart: UarteTx<'static>, mut watchdog: WatchdogHandle) -> ! {
     let mut transmitted_pairs = 0_u32;
     let mut volume_sequence = 0_u16;
+    // One reusable wire buffer: each encoded slice is written before the next encode starts, so
+    // sharing storage avoids copying a 744-byte frame into this task's state per channel.
+    let mut wire = [0_u8; MAX_WIRE_FRAME_BYTES];
     loop {
         // Neither branch consumes its item until it is selected, so losing the race cannot drop a
         // queued value.
@@ -283,11 +289,11 @@ async fn uart_tx_task(mut uart: UarteTx<'static>, mut watchdog: WatchdogHandle) 
                     frame_duration: LinkFrameDuration::Millis10,
                     flags: pair.flags,
                 };
-                let Ok(encoded) = encode(left_meta, &pair.left) else {
+                let Ok(encoded) = encode_into(left_meta, &pair.left, &mut wire) else {
                     defmt::warn!("left LC3 frame exceeded link capacity");
                     continue;
                 };
-                if uart.write(encoded.as_bytes()).await.is_err() {
+                if uart.write(encoded).await.is_err() {
                     defmt::warn!("stereo LC3 UART write failed");
                     continue;
                 }
@@ -297,11 +303,11 @@ async fn uart_tx_task(mut uart: UarteTx<'static>, mut watchdog: WatchdogHandle) 
                     ase_id: pair.right_ase_id,
                     ..left_meta
                 };
-                let Ok(encoded) = encode(right_meta, &pair.right) else {
+                let Ok(encoded) = encode_into(right_meta, &pair.right, &mut wire) else {
                     defmt::warn!("right LC3 frame exceeded link capacity");
                     continue;
                 };
-                if uart.write(encoded.as_bytes()).await.is_err() {
+                if uart.write(encoded).await.is_err() {
                     defmt::warn!("stereo LC3 UART write failed");
                     continue;
                 }
@@ -324,11 +330,11 @@ async fn uart_tx_task(mut uart: UarteTx<'static>, mut watchdog: WatchdogHandle) 
                     flags: FrameFlags::empty(),
                 };
                 volume_sequence = volume_sequence.wrapping_add(1);
-                let Ok(frame) = encode(meta, &command.to_payload()) else {
+                let Ok(frame) = encode_into(meta, &command.to_payload(), &mut wire) else {
                     defmt::warn!("could not encode a volume frame");
                     continue;
                 };
-                if uart.write(frame.as_bytes()).await.is_err() {
+                if uart.write(frame).await.is_err() {
                     defmt::warn!("volume UART write failed");
                     continue;
                 }

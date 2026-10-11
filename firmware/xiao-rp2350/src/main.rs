@@ -496,15 +496,12 @@ fn main() -> ! {
     let mut watchdog = Watchdog::new(p.WATCHDOG);
     let watchdog_reset = watchdog::start(&mut watchdog);
     defmt::info!("RP2350 system clock={} Hz", embassy_rp::clocks::clk_sys_freq());
-    let mut uart_config = UartConfig::default();
-    uart_config.baudrate = 1_000_000;
-    static UART_RX_BUFFER: StaticCell<[u8; 8192]> = StaticCell::new();
-    let uart = BufferedUartRx::new(p.UART0, Irqs, p.PIN_1, UART_RX_BUFFER.init([0; 8192]), uart_config);
     let usb = embassy_rp::usb::host::Driver::new(p.USB, Irqs);
     let led = StatusLed {
         user: Output::new(p.PIN_25, Level::High),
     };
     let (pcm_sender, pcm_receiver) = audio::init_pcm_channel();
+    let (uart0, uart_rx_pin) = (p.UART0, p.PIN_1);
 
     spawn_core1(
         p.CORE1,
@@ -512,6 +509,13 @@ fn main() -> ! {
         // its static stack storage. `spawn_core1` retains it for the lifetime of that core.
         unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) },
         move || {
+            // Built here so `BufferedUartRx::new` enables the UART interrupt in core 1's NVIC,
+            // the core that actually drains it; enabling it on core 0 would route RX wakeups to
+            // the core running USB.
+            let mut uart_config = UartConfig::default();
+            uart_config.baudrate = 1_000_000;
+            static UART_RX_BUFFER: StaticCell<[u8; 8192]> = StaticCell::new();
+            let uart = BufferedUartRx::new(uart0, Irqs, uart_rx_pin, UART_RX_BUFFER.init([0; 8192]), uart_config);
             let executor = EXECUTOR_CORE1.init(Executor::new());
             executor.run(|spawner| spawner.spawn(unwrap!(audio_ingest_task(uart, pcm_sender))));
         },
